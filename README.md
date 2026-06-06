@@ -28,6 +28,7 @@ docker run -d --privileged \
 -v /tmp/vllm_cache:/tmp/vllm_cache \
 -v /tmp/nki_cache:/tmp/nki_cache \
 --env "HF_TOKEN=$HF_TOKEN" \
+--env "NEURON_SKIP_EFA_AFFINITY=1" \
 -p 8000:8000 \
 --ipc=host \
 --device /dev/neuron0 --device /dev/neuron1 --device /dev/neuron2 --device /dev/neuron3 \
@@ -68,6 +69,18 @@ vllm serve: error: argument --additional-config: Value { \
 } cannot be converted to <function loads at 0x7f848b64f2e0>.
 ```
 
-doing the same with the additional-config, and I get an error.
+doing the same without the additional-config, and it seems to work. You can then use curl to call the API:
 
-
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Hello"
+        }
+    ]
+    }'
+```
