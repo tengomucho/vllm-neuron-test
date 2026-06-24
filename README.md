@@ -84,3 +84,7 @@ curl http://localhost:8000/v1/chat/completions \
     ]
     }'
 ```
+
+## Sources
+
+Sources for vLLM Neuron are in the container, in `/opt/conda/lib/python3.12/site-packages/vllm_neuron`. For convenience, I copied that directory to vllm_neuron.
