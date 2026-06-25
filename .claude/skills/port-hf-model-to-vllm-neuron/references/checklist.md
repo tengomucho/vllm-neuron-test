@@ -42,9 +42,12 @@ carry over between model families.
 ## Device/compile (separate from CPU correctness)
 - [ ] Attention head_dim > 128 → can't use the flash/decode NKI kernel; plain torch ops work
       on CPU and for head_dim<=128 on-device, but at large head dims (256/512) neuronx-cc may
-      fail with `[NCC_IGCA024] Illegal IR, encountered undefined use`. Then split head_dim into
-      <=128 chunks for the kernel, or write an NKI attention. Validate the kernel path on a tiny
-      same-architecture model first (e.g. tiny-random/<arch>) — fast on-device iterations.
+      fail with `[NCC_IGCA024] Illegal IR, encountered undefined use`. Localize the offending op
+      first (XLA_HLO_DEBUG=1 + stub-out bisection); fixes are an NKI attention for head_dim>128 or
+      a torch reformulation of the bad op — NOT naive head-dim splitting onto the flash kernel
+      (flash fuses softmax, so per-chunk scores can't be recombined without an online-softmax merge
+      the kernel doesn't expose). Validate any kernel path on a tiny same-architecture model first
+      (e.g. tiny-random/<arch>), and reproduce the >128 path on a small synthetic head_dim=256 model.
 - [ ] MoE: moe_cte/build_blockwise_mapping is PREFILL-ONLY (`f_len=min(128,total_tokens//16)`
       → modulo-by-zero for the few decode tokens). Use a vectorized local-expert einsum for decode.
 - [ ] MoE `moe_cte` kernel requires the hidden dim be a multiple of 512 → zero-pad the expert
