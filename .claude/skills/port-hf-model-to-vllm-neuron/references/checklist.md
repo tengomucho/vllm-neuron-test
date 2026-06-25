@@ -40,7 +40,13 @@ carry over between model families.
 - [ ] PLE / per-layer-input embeddings — only if `hidden_size_per_layer_input > 0`.
 
 ## Device/compile (separate from CPU correctness)
-- [ ] Attention head_dim > 128 → can't use the flash/decode NKI kernel; use plain torch ops.
+- [ ] Attention head_dim > 128 → can't use the flash/decode NKI kernel; plain torch ops work
+      on CPU and for head_dim<=128 on-device, but at large head dims (256/512) neuronx-cc may
+      fail with `[NCC_IGCA024] Illegal IR, encountered undefined use`. Then split head_dim into
+      <=128 chunks for the kernel, or write an NKI attention. Validate the kernel path on a tiny
+      same-architecture model first (e.g. tiny-random/<arch>) — fast on-device iterations.
+- [ ] MoE: moe_cte/build_blockwise_mapping is PREFILL-ONLY (`f_len=min(128,total_tokens//16)`
+      → modulo-by-zero for the few decode tokens). Use a vectorized local-expert einsum for decode.
 - [ ] MoE `moe_cte` kernel requires the hidden dim be a multiple of 512 → zero-pad the expert
       hidden dim (and unpad the output); a numerical no-op. (gpt_oss pads hidden globally.)
 - [ ] Buffers built in `__init__` (RoPE inv_freq) must use `device="cpu"` (model on meta device).
