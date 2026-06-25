@@ -219,6 +219,16 @@ def register():
 
     _patch_dcp_config_validation()
 
+    # Register custom HF config types (e.g. gemma4_text) with transformers so
+    # vLLM can parse their config.json on older transformers. Must happen before
+    # vLLM's ModelConfig calls AutoConfig.from_pretrained.
+    try:
+        from vllm_neuron.model.gemma4.hf_config import register_gemma4_configs
+
+        register_gemma4_configs()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Failed to register gemma4 configs: %s", e)
+
     return get_platform_class()
 
 

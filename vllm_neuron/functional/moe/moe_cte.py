@@ -340,6 +340,12 @@ def _apply_activation(gate: Tensor, activation_function: ActFnType) -> Tensor:
         return torch.nn.functional.silu(gate)
     elif activation_function == ActFnType.GELU:
         return torch.nn.functional.gelu(gate)
+    elif activation_function == ActFnType.GELU_Tanh_Approx:
+        # Elementary-op gelu_tanh so the torch fallback stays traceable on Neuron
+        # (the patched F.gelu is marked-skipped by dynamo during graph extraction).
+        g = gate.to(torch.float32)
+        out = 0.5 * g * (1.0 + torch.tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)))
+        return out.to(gate.dtype)
     elif activation_function == ActFnType.Swish:
         swiglu_alpha = 1.702  # This value is baked into the NKI ISA
         return gate * torch.sigmoid(gate * swiglu_alpha)
