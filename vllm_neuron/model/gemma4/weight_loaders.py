@@ -112,57 +112,68 @@ def mlp_down_loader(inter_per_rank: int) -> SafetensorsWeightLoader:
 
 
 def expert_gate_up_loader(
-    num_experts: int, moe_intermediate: int, inter_per_rank: int, hidden_pad: int
+    num_local_experts: int,
+    moe_intermediate: int,
+    inter_per_rank: int,
+    tp_degree: int,
+    hidden_pad: int,
 ) -> SafetensorsWeightLoader:
-    """experts.gate_up_proj: HF [E, 2*I, hidden] -> [E, hidden_pad, 2*inter_per_rank].
+    """experts.gate_up_proj: HF [E, 2*I, hidden] -> [E_local, hidden_pad, 2*inter_per_rank].
 
-    Rows 0:I are gate, I:2I are up. Shards the intermediate dim across TP and
-    concatenates the rank's gate/up shards as [gate_shard, up_shard]. The hidden
-    dim is zero-padded to hidden_pad for the moe_cte kernel (no-op numerically)."""
+    EP shards the expert count: this rank owns local experts
+    [ep_rank*E_local, (ep_rank+1)*E_local) where ep_rank = rank // tp_degree.
+    TP shards the intermediate dim by tp_rank = rank % tp_degree. Rows 0:I are
+    gate, I:2I are up. Hidden dim zero-padded to hidden_pad for the moe_cte kernel."""
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         w = slices[0]  # [E, 2*I, hidden]
-        gstart = rank * inter_per_rank
+        ep_rank = rank // tp_degree
+        tp_rank = rank % tp_degree
+        offset = ep_rank * num_local_experts
+        gstart = tp_rank * inter_per_rank
         gend = gstart + inter_per_rank
-        ustart = moe_intermediate + rank * inter_per_rank
+        ustart = moe_intermediate + tp_rank * inter_per_rank
         uend = ustart + inter_per_rank
         out = []
-        for e in range(num_experts):
+        for li in range(num_local_experts):
+            e = offset + li
             gate = w[e][gstart:gend, :]  # [inter_per_rank, hidden]
             up = w[e][ustart:uend, :]
             fused = torch.cat([gate, up], dim=0)  # [2*inter_per_rank, hidden]
             t = fused.T.contiguous()  # [hidden, 2*inter_per_rank]
             if hidden_pad != t.shape[0]:
                 t = torch.nn.functional.pad(t, (0, 0, 0, hidden_pad - t.shape[0]))
-            out.append(t)  # [hidden_pad, 2*inter_per_rank]
-        return torch.stack(out, dim=0)  # [E, hidden_pad, 2*inter_per_rank]
+            out.append(t)
+        return torch.stack(out, dim=0)  # [E_local, hidden_pad, 2*inter_per_rank]
 
     return SafetensorsWeightLoader(transform=transform)
 
 
 def expert_down_loader(
-    num_experts: int, inter_per_rank: int, hidden_pad: int
+    num_local_experts: int, inter_per_rank: int, tp_degree: int, hidden_pad: int
 ) -> SafetensorsWeightLoader:
-    """experts.down_proj: HF [E, hidden, I] -> [E, inter_per_rank, hidden_pad],
+    """experts.down_proj: HF [E, hidden, I] -> [E_local, inter_per_rank, hidden_pad],
     with per_expert_scale folded in (slices[1] = router.per_expert_scale [E]).
-    Hidden dim zero-padded to hidden_pad for the moe_cte kernel."""
+    EP slices local experts; TP shards the intermediate dim."""
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         w = slices[0]  # [E, hidden, I]
         per_expert_scale = slices[1][:].to(torch.float32)  # [E]
-        start = rank * inter_per_rank
+        ep_rank = rank // tp_degree
+        tp_rank = rank % tp_degree
+        offset = ep_rank * num_local_experts
+        start = tp_rank * inter_per_rank
         end = start + inter_per_rank
         out = []
-        for e in range(num_experts):
+        for li in range(num_local_experts):
+            e = offset + li
             down = w[e][:, start:end]  # [hidden, inter_per_rank]
             down = down.T.contiguous().to(torch.float32)  # [inter_per_rank, hidden]
             down = down * per_expert_scale[e]
             down = down.to(torch.bfloat16)
             if hidden_pad != down.shape[1]:
-                down = torch.nn.functional.pad(
-                    down, (0, hidden_pad - down.shape[1])
-                )
-            out.append(down)  # [inter_per_rank, hidden_pad]
-        return torch.stack(out, dim=0)  # [E, inter_per_rank, hidden_pad]
+                down = torch.nn.functional.pad(down, (0, hidden_pad - down.shape[1]))
+            out.append(down)
+        return torch.stack(out, dim=0)  # [E_local, inter_per_rank, hidden_pad]
 
     return SafetensorsWeightLoader(transform=transform)

@@ -432,11 +432,32 @@ class Gemma4Experts(nn.Module):
 
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
-        self.inter_per_rank = config.moe_intermediate_size // self.world_size
         self.block_size = 256
-        # The moe_cte NKI kernel tiles the hidden dim and requires it to be a
-        # multiple of 512. Pad the expert hidden dim with zeros (a numerical
-        # no-op) so the kernel compiles; unpad the output.
+
+        # >>> PARALLELISM: TP + EP. EP shards the expert COUNT across ep ranks;
+        # TP shards each expert's intermediate dim across tp ranks (tp = world/ep).
+        from vllm.config import get_current_vllm_config
+
+        self.ep_enabled = (
+            get_current_vllm_config().parallel_config.enable_expert_parallel
+        )
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_ep_degree,
+            get_neuron_ep_rank,
+            get_neuron_ep_tp_group,
+        )
+
+        self.ep_degree = get_neuron_ep_degree() if self.ep_enabled else 1
+        self.ep_rank = get_neuron_ep_rank() if self.ep_enabled else 0
+        self.tp_degree = self.world_size // self.ep_degree
+        self.ep_tp_group = (
+            get_neuron_ep_tp_group() if self.ep_enabled else self.tp_group
+        )
+        self.num_local_experts = self.num_experts // self.ep_degree
+        self.expert_offset = self.ep_rank * self.num_local_experts
+        self.inter_per_rank = config.moe_intermediate_size // self.tp_degree
+        # moe_cte NKI kernel tiles the hidden dim and needs it a multiple of 512.
+        # Pad the expert hidden dim with zeros (numerical no-op); unpad output.
         self.hidden_pad = ((self.hidden_size + 511) // 512) * 512
 
         self.router_weight = nn.Parameter(
@@ -447,7 +468,7 @@ class Gemma4Experts(nn.Module):
         )
         self.gate_up_proj_weight = nn.Parameter(
             torch.empty(
-                self.num_experts,
+                self.num_local_experts,
                 self.hidden_pad,
                 self.inter_per_rank * 2,
                 dtype=self.dtype,
@@ -455,7 +476,10 @@ class Gemma4Experts(nn.Module):
         )
         self.down_proj_weight = nn.Parameter(
             torch.empty(
-                self.num_experts, self.inter_per_rank, self.hidden_pad, dtype=self.dtype
+                self.num_local_experts,
+                self.inter_per_rank,
+                self.hidden_pad,
+                dtype=self.dtype,
             )
         )
 
@@ -464,21 +488,29 @@ class Gemma4Experts(nn.Module):
         set_weight_loader(
             self.gate_up_proj_weight,
             WL.expert_gate_up_loader(
-                self.num_experts,
+                self.num_local_experts,
                 config.moe_intermediate_size,
                 self.inter_per_rank,
+                self.tp_degree,
                 self.hidden_pad,
             ),
         )
         set_weight_loader(
             self.down_proj_weight,
             WL.expert_down_loader(
-                self.num_experts, self.inter_per_rank, self.hidden_pad
+                self.num_local_experts,
+                self.inter_per_rank,
+                self.tp_degree,
+                self.hidden_pad,
             ),
         )
 
     def forward(
-        self, router_input: torch.Tensor, expert_input: torch.Tensor, is_prefill: bool
+        self,
+        router_input: torch.Tensor,
+        expert_input: torch.Tensor,
+        is_prefill: bool,
+        rank: torch.Tensor | None = None,
     ):
         """router_input: raw post-attn residual [T, H]; expert_input:
         pre_feedforward_layernorm_2(residual) [T, H]."""
@@ -493,6 +525,21 @@ class Gemma4Experts(nn.Module):
             router_computation_order=RouterComputationOrder.PRENORM_LINEAR_ACT_TOPK_RENORM_SCATTER,
         )
 
+        # >>> EP: keep only this rank's local experts' affinities [T, E_local] <<<
+        if self.ep_degree > 1:
+            ep_rank = (rank % (self.ep_degree * self.tp_degree)) // self.tp_degree
+            local_idx = (
+                torch.arange(
+                    self.num_local_experts,
+                    device=expert_input.device,
+                    dtype=torch.int32,
+                )
+                + ep_rank.to(torch.int32) * self.num_local_experts
+            )
+            expert_affinities = NF.get_local_expert_affinities(
+                expert_affinities, local_idx
+            )
+
         # Pad hidden dim to the kernel-friendly size (zeros).
         h_in = expert_input.to(self.dtype)
         if self.hidden_pad != self.hidden_size:
@@ -503,16 +550,16 @@ class Gemma4Experts(nn.Module):
         if not is_prefill:
             # Decode: the moe_cte blockwise mapping is prefill-only (it divides
             # by total_tokens//16, which is 0 for the few decode tokens). Use a
-            # vectorized all-expert computation instead (cheap for few tokens),
+            # vectorized local-expert computation instead (cheap for few tokens),
             # equivalent to moe_cte POST_SCALE.
             gu = self.gate_up_proj_weight.reshape(
-                self.num_experts, self.hidden_pad, 2, self.inter_per_rank
+                self.num_local_experts, self.hidden_pad, 2, self.inter_per_rank
             )
             gate = torch.einsum("th,ehi->eti", h_in, gu[:, :, 0, :])
             up = torch.einsum("th,ehi->eti", h_in, gu[:, :, 1, :])
-            inter = _gelu_tanh(gate) * up  # [E, T, I]
+            inter = _gelu_tanh(gate) * up  # [E_local, T, I]
             outs = torch.einsum("eti,eih->eth", inter, self.down_proj_weight)
-            aff = expert_affinities.to(outs.dtype).T.unsqueeze(-1)  # [E, T, 1]
+            aff = expert_affinities.to(outs.dtype).T.unsqueeze(-1)  # [E_local, T, 1]
             output = (outs * aff).sum(0)  # [T, hidden_pad]
             if self.hidden_pad != self.hidden_size:
                 output = output[:, : self.hidden_size]
@@ -528,15 +575,15 @@ class Gemma4Experts(nn.Module):
             conditions,
         ) = NF.build_blockwise_mapping(
             expert_affinities=expert_affinities,
-            num_local_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
             num_experts_per_token=self.num_experts_per_token,
             block_size=self.block_size,
-            moe_group=self.tp_group,
-            tp_degree=self.world_size,
+            moe_group=self.ep_tp_group,
+            tp_degree=self.tp_degree,
             padding_mask=None,
         )
         num_static_block = math.ceil(
-            num_tokens * self.num_experts_per_token / self.block_size
+            num_tokens * self.num_experts_per_token / self.ep_degree / self.block_size
         )
         output = NF.moe_cte(
             implementation=MoECTEImplementation.shard_on_block,
@@ -544,7 +591,7 @@ class Gemma4Experts(nn.Module):
             hidden_states=h_in,
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=self.gate_up_proj_weight.reshape(
-                self.num_experts, self.hidden_pad, 2, self.inter_per_rank
+                self.num_local_experts, self.hidden_pad, 2, self.inter_per_rank
             ),
             down_proj_weight=self.down_proj_weight,
             activation_function=ActFnType.GELU_Tanh_Approx,
@@ -593,7 +640,9 @@ class Gemma4DecoderLayer(nn.Module):
         self.layer_scalar = nn.Parameter(torch.ones(1, dtype=dt))
         set_weight_loader(self.layer_scalar, WL.passthrough_loader())
 
-    def forward(self, hidden_states, positions, cos_sin, attn_metadata, is_prefill):
+    def forward(
+        self, hidden_states, positions, cos_sin, attn_metadata, is_prefill, rank=None
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -609,7 +658,7 @@ class Gemma4DecoderLayer(nn.Module):
         h1 = self.post_feedforward_layernorm_1(mlp_out)
         # MoE branch (router reads raw residual; experts read their own norm)
         expert_in = self.pre_feedforward_layernorm_2(residual)
-        moe_out = self.experts(residual, expert_in, is_prefill)
+        moe_out = self.experts(residual, expert_in, is_prefill, rank)
         h2 = self.post_feedforward_layernorm_2(moe_out)
 
         hidden_states = h1 + h2
@@ -679,7 +728,12 @@ class Gemma4Model(nn.Module):
                 else "full_attention"
             )
             hidden_states = layer(
-                hidden_states, positions, cos_sin[ltype], attn_metadata, is_prefill
+                hidden_states,
+                positions,
+                cos_sin[ltype],
+                attn_metadata,
+                is_prefill,
+                rank,
             )
 
         hidden_states = self.norm(hidden_states)

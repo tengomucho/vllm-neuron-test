@@ -44,8 +44,3 @@ class Gemma4ForCausalLM(nn.Module):
                 "quantization='mxfp4' is not yet supported for Gemma4. "
                 "Use quantization='bf16' or leave unset."
             )
-        ep = neuron_config.ep_degree if neuron_config else 1
-        if ep and ep > 1:
-            raise ValueError(
-                "Expert parallelism (ep_degree>1) is not yet supported for Gemma4."
-            )
