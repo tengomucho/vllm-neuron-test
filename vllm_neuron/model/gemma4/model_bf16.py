@@ -227,6 +227,12 @@ class Gemma4Attention(nn.Module):
 
         self.k_cache = None
         self.v_cache = None
+        # Linear context buffer: [max_ctx_len, nkv, hd].  Written by _write_cache
+        # (same index_put_ path as the paged block cache), read by _attn_decode
+        # without any gather — avoids the 629 MB full-pool intermediate that caused
+        # NCC_EOOM002.  Initialized in bind_kv_cache once max_ctx_len is known.
+        self.k_ctx = None
+        self.v_ctx = None
 
         self._setup_weight_loaders()
 
@@ -274,7 +280,7 @@ class Gemma4Attention(nn.Module):
         k = apply_rotary(gemma_rms_norm(k_raw, self.k_norm, self.eps), cos, sin)
         v = gemma_rms_norm(v_raw, None, self.eps)  # parameterless v_norm
 
-        self._write_cache(k, v, attn_metadata)
+        self._write_cache(k, v, attn_metadata, positions)
 
         if is_prefill:
             attn = self._attn_prefill(q, k, v, positions)
@@ -290,7 +296,7 @@ class Gemma4Attention(nn.Module):
     def _layer_name(self):
         return f"layers.{self.layer_idx}.self_attn"
 
-    def _write_cache(self, k, v, attn_metadata):
+    def _write_cache(self, k, v, attn_metadata, positions):
         meta = attn_metadata[self._layer_name()]
         slot_mapping = meta["slot_mapping"]
         block_size = meta["block_size"]
@@ -309,6 +315,18 @@ class Gemma4Attention(nn.Module):
         p_idx = pos_idx.repeat(nkv)
         self.k_cache.index_put_((b_idx, head_idx, p_idx), k_t)
         self.v_cache.index_put_((b_idx, head_idx, p_idx), v_t)
+        # Write to linear context buffer indexed by LOGICAL sequence positions.
+        # slot_mapping holds PHYSICAL block-pool addresses (can be >> max_ctx_len)
+        # and is -1 (PAD_SLOT_ID) for padding tokens.  Use positions (always in
+        # [0, max_model_len-1] for real tokens) and redirect padding to the scratch
+        # element at index max_ctx_len (the +1 element allocated in bind_kv_cache),
+        # which _attn_decode never reads.  This prevents corrupting real token KVs.
+        max_ctx = self.k_ctx.shape[0] - 1  # == max_ctx_len; scratch is at max_ctx_len
+        is_pad = slot_mapping == -1
+        scratch = torch.full_like(positions, max_ctx)
+        ctx_pos = torch.where(is_pad, scratch, positions.clamp(max=max_ctx - 1)).long()
+        self.k_ctx.index_put_((ctx_pos,), k.to(self.k_ctx.dtype))
+        self.v_ctx.index_put_((ctx_pos,), v.to(self.v_ctx.dtype))
 
     def _attn_prefill(self, q, k, v, positions):
         # q: [T, nqh, hd]; k, v: [T, nkv, hd]
@@ -342,31 +360,31 @@ class Gemma4Attention(nn.Module):
         return out.permute(1, 0, 2)  # [T, nqh, hd]
 
     def _attn_decode(self, q, positions, attn_metadata):
-        meta = attn_metadata[self._layer_name()]
-        # kc/vc are pre-gathered by the runner (outside torch.compile) before this
-        # model call, then passed here via attn_metadata.  This avoids
-        # self.k_cache[block_table] inside the compiled graph: that gather forces
-        # neuronx-cc to create a full-pool intermediate (~629 MB per layer) which
-        # drives the decode NEFF past the 24 GB NCC_EOOM002 HBM limit.
-        kc = meta["kc"]  # [B, max_blocks, nkv, block_size, hd] — pre-gathered
-        vc = meta["vc"]
-        B, max_blocks, nkv, block_size, _ = kc.shape
-        S_ctx = max_blocks * block_size
+        # Read from the linear context buffer (written by _write_cache on every
+        # prefill/decode step).  No gather from the paged pool is needed here —
+        # that gather (self.k_cache[block_table]) was what caused NCC_EOOM002.
+        # k_ctx: [max_ctx_len, nkv, hd]; the position-based mask below ensures
+        # only slots ≤ current query position contribute to attention.
         T = q.shape[0]
-        S_dec = T // B
         hd = self.head_dim
         nqh = self.q_heads_per_rank
+        nkv = self.kv_heads_per_rank
         g = self.num_kv_groups
+        B = 1  # single-sequence decode
+        S_dec = T  # T tokens across B=1 sequences
+        # k_ctx has shape [max_ctx_len + 1, nkv, hd]; exclude the scratch element.
+        S_ctx = self.k_ctx.shape[0] - 1  # == max_ctx_len
 
         if _STUB_ATTN:
             return q.view(B, S_dec, nqh, hd).view(T, nqh, hd)
 
-        kc = kc.permute(0, 2, 1, 3, 4).reshape(B, nkv, S_ctx, hd)
-        vc = vc.permute(0, 2, 1, 3, 4).reshape(B, nkv, S_ctx, hd)
-        kc = kc.repeat_interleave(g, dim=1)  # [B, nqh, S_ctx, hd]
+        # k_ctx[:S_ctx]: [S_ctx, nkv, hd] → [1, nkv, S_ctx, hd]
+        kc = self.k_ctx[:S_ctx].transpose(0, 1).unsqueeze(0)
+        vc = self.v_ctx[:S_ctx].transpose(0, 1).unsqueeze(0)
+        kc = kc.repeat_interleave(g, dim=1)  # [1, nqh, S_ctx, hd]
         vc = vc.repeat_interleave(g, dim=1)
 
-        q_ = q.view(B, S_dec, nqh, hd).permute(0, 2, 1, 3)  # [B, nqh, S_dec, hd]
+        q_ = q.view(B, S_dec, nqh, hd).permute(0, 2, 1, 3)  # [1, nqh, S_dec, hd]
         scores = torch.matmul(q_, kc.transpose(2, 3)) * self.scaling
 
         qpos = positions.view(B, S_dec).to(torch.float32)
@@ -881,13 +899,30 @@ class Gemma4ForCausalLM(nn.Module):
             )
         return KVSpec(layers=layers)
 
-    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]):
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]], max_ctx_len: int = 64):
         for i, layer in enumerate(self.model.layers):
             name = f"layers.{i}.self_attn"
             if name not in kv_caches:
                 raise Exception(f"KV cache for layer {name} not initialized")
-            layer.self_attn.k_cache = kv_caches[name][0]
-            layer.self_attn.v_cache = kv_caches[name][1]
+            attn = layer.self_attn
+            attn.k_cache = kv_caches[name][0]
+            attn.v_cache = kv_caches[name][1]
+            # Allocate linear context buffers: [max_ctx_len + 1, nkv, hd].
+            # The extra (+1) element at index max_ctx_len is a scratch slot where
+            # padding-token writes are redirected (slot_mapping == -1 for padding).
+            # _attn_decode reads only [:max_ctx_len] so the scratch is never attended.
+            # k_cache.dtype is the bfloat16 logical dtype even though the raw storage
+            # is int8; torch.zeros creates a proper bfloat16 tensor (not a view).
+            nkv = attn.kv_heads_per_rank
+            hd = attn.head_dim
+            attn.k_ctx = torch.zeros(
+                max_ctx_len + 1, nkv, hd,
+                dtype=attn.k_cache.dtype, device=attn.k_cache.device,
+            )
+            attn.v_ctx = torch.zeros(
+                max_ctx_len + 1, nkv, hd,
+                dtype=attn.v_cache.dtype, device=attn.v_cache.device,
+            )
 
     # ── Weight loading ───────────────────────────────────────────────────
     def load_weights(

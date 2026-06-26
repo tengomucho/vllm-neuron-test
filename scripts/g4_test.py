@@ -68,10 +68,15 @@ if cpu:
 print(f"LLM config: model={model}, TP={tp}, EP={ep}, CPU={cpu}, max_len={max_len}")
 llm = LLM(**kw)
 
-prompt_ids = [10, 20, 30, 40, 50, 60, 70, 80]
+# "What is the capital of France? Answer in one word." — 13 tokens with BOS.
+# Expected first token: 50429 ("Paris") for the real 26B model.
+# For tiny/random models any output is acceptable.
+prompt_ids = [2, 3689, 563, 506, 5279, 529, 7001, 236881, 25685, 528, 886, 3658, 236761]
 out = llm.generate(
     [TokensPrompt(prompt_token_ids=prompt_ids)],
-    SamplingParams(temperature=0.0, max_tokens=8),
+    SamplingParams(temperature=0.0, max_tokens=16),
 )
 print("TOKIDS:", list(out[0].outputs[0].token_ids))
 print("TEXT:  ", repr(out[0].outputs[0].text))
+if 50429 in list(out[0].outputs[0].token_ids):
+    print("PASS: Paris (50429) found in output!")
