@@ -2,12 +2,14 @@
 
 ## TL;DR for the next session
 
-A Gemma4 text-decoder is **implemented and validated correct** in this repo
-(`vllm_neuron/model/gemma4/`, branch `feat/gemma4-vllm-neuron`). The two compiler
-blockers that prevented on-device serving of the 26B model have been fixed
-(commit `78259a3`).  The 26B model now compiles past the `NCC_IGCA024` step and the
-`moe_cte OOB` step (observed in run2 log).  **The final gate is whether the full
-26B NEFF compile and inference runs end-to-end.**
+A Gemma4 text-decoder is **implemented, compiled, and running** in this repo
+(`vllm_neuron/model/gemma4/`, branch `feat/gemma4-vllm-neuron`). All compiler
+blockers have been fixed. The 26B model (`google/gemma-4-26B-A4B-it`) **compiles
+and produces token output** end-to-end on trn2.48xlarge (TP=8, EP=1).
+
+**Outstanding**: decode attention produces zero-context output (garbage text) because
+the KV pre-gather uses zero tensors instead of actually reading from the paged cache.
+See "Decode KV pre-gather limitation" below. Everything else works.
 
 ---
 
@@ -20,8 +22,10 @@ blockers that prevented on-device serving of the 26B model have been fixed
 - **On-device, synthetic `gemma4-hd256`** (head_dim=256/512): **CPU-identical output**
   `[80, 337, 337, ...]` at TP=4 after the `torch.where` mask fix — confirms the
   attention fix works for large head dims.
-- **26B model**: compilation reached neuronx-cc backend ("Compiling...") — both
-  NCC_IGCA024 and moe_cte OOB errors are resolved. Full compile still in progress.
+- **26B model end-to-end (Run 11)**: prefill + decode both compile and run.
+  Post-compile HBM: 6.56 GiB used / 17.44 GiB free (well under 24 GB limit).
+  `TOKIDS: [129455, 236772, ...]` and `TEXT: 'ΟΣ-------'` printed successfully.
+  ⚠️ Decode text is garbage — see "Decode KV pre-gather limitation" below.
 
 ## Files changed (commit 78259a3)
 
@@ -69,13 +73,43 @@ doesn't, attn is the trigger).
 
 ---
 
-## Outstanding (if the 26B compile completes successfully)
+## Outstanding
 
-1. **Run the serving recipe** (see below) with `vllm serve /root/gemma4-text ...`.
-2. **Verify coherent output**: curl the chat endpoint, expect "Paris" for the capital
-   of France question.
-3. **Finalize the skill** at `.claude/skills/port-hf-model-to-vllm-neuron/` with the
-   head_dim>128 guidance and moe_cte token-count guidance.
+### Decode KV pre-gather limitation (key remaining work)
+
+**Problem**: The decode `_attn_decode` needs to read `kc`/`vc` (pre-gathered KV blocks)
+from the paged block cache. The natural approach is to gather from `k_cache` on the host
+before the model call. However, in the non-native (XLA/vllm_neuron) backend, `k_cache`
+is a cross-dtype storage view (int8 raw storage reinterpreted as bfloat16) on `neuron:0`
+device. PyTorch's fancy indexing (`k_cache[block_table]`) raises
+`RuntimeError: Expected self.dtype() == dst.dtype()` because the advanced-indexing
+`copy_` path sees `storage.dtype=int8` while `tensor.dtype=bfloat16`.
+
+**Current workaround**: `_pregather_decode_kv()` injects zero tensors of the correct
+shape `[B, max_blocks, nkv, block_size, hd]` for `kc`/`vc`. This eliminates the 629 MB
+gather intermediate from the NEFF (fixing NCC_EOOM002) but decode attention has no
+context → uniform attention over zeros → garbage output.
+
+**To fix correctly**, choose one:
+1. **CPU mirror**: maintain a CPU copy of k_cache, update it after each prefill/decode
+   step via `k_cache.cpu()` (expensive: 629 MB per layer transfer), gather on CPU,
+   move result to device. Only practical if the test model is small.
+2. **Linear context buffer**: add `self.k_ctx` / `self.v_ctx` tensors of shape
+   `[B, max_model_len, nkv, hd]` (32 KB for max_model_len=64) to the attention module.
+   Write to them in `_write_cache` alongside the paged pool. In `_attn_decode`, read
+   from `self.k_ctx` directly — no gather needed. These small tensors are INOUT in the
+   NEFF and won't cause HBM issues.
+3. **NKI gather kernel**: write a NKI kernel that does the block-table gather on-device
+   inside the compiled graph but with bounded HBM usage (tiled gather, one block at a
+   time, so peak intermediate is `[B, nkv, block_size, hd]` ≈ 16 KB not 629 MB).
+
+Option 2 (linear context buffer) is the cleanest long-term fix.
+
+### After fixing the KV pre-gather
+1. **Verify coherent output**: run the 26B test again, expect coherent (not garbage) text.
+2. **Run the serving recipe** with `vllm serve /root/gemma4-text ...`.
+3. **Verify serving**: curl the chat endpoint, expect "Paris" for the capital question.
+4. **Finalize the skill** at `.claude/skills/port-hf-model-to-vllm-neuron/`.
 
 ---
 
@@ -196,6 +230,19 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 - Attention masks use `-1e30` not `float("-inf")`, AND use additive mask not
   `torch.where(cond, scalar_0, scalar_-1e30)` — the scalar-broadcast form triggers
   NCC_IGCA024 at head_dim > 128.
+- **Decode HBM OOM (NCC_EOOM002)**: `self.k_cache[block_table]` inside the compiled
+  decode graph creates a full-pool intermediate (~629 MB per layer). Fix: pass
+  pre-gathered `kc`/`vc` tensors via `attn_metadata["kc"]`/`["vc"]` as model inputs
+  instead of doing the gather inside the NEFF. In `_attn_decode`, read from
+  `meta["kc"]`/`meta["vc"]` directly. The runner populates these before each model
+  call via `_pregather_decode_kv()`. `_write_cache` (index_put_, write-only) stays
+  inside the NEFF and is safe — same pattern as prefill which compiled fine.
+- **k_cache cross-dtype view**: in the non-native backend, k_cache is an int8 raw
+  tensor reinterpreted as bfloat16 on `neuron:0`. Fancy indexing `k_cache[bt]` from
+  Python host fails with "Expected self.dtype() == dst.dtype()". Work around by
+  injecting `torch.zeros(...)` of the correct shape into `meta["kc"]`/`["vc"]` instead
+  of actually gathering — correct for graph tracing/compilation; produces zero-context
+  attention at runtime (see outstanding section for production fix).
 - RoPE `inv_freq` buffers built with `device="cpu"` (model is constructed under
   `torch.device("meta")`).
 - Checkpoint weight keys: the 26B HF checkpoint uses `model.language_model.*`

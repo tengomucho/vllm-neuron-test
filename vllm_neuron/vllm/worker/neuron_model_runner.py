@@ -631,6 +631,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output: KVConnectorOutput | None = None
         # Full (2, ...) KV cache tensors for DI connector registration
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
+        # Per-layer [k, v] cache tensors; used for decode KV pre-gather.
+        self._kv_caches: dict[str, list[torch.Tensor]] = {}
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -991,6 +993,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10",
             "--internal-backend-options=--enable-verifier=false",
         ]
+
+        # Merge any user-supplied compiler_args from additional_config["neuron_config"].
+        # Allows passing extra neuronx-cc flags at runtime, e.g.:
+        #   additional_config={"neuron_config": {"compiler_args": "--hbm-scratchpad-page-size=1024"}}
+        _extra_cc_args = (
+            self.vllm_config.additional_config.get("neuron_config", {}).get("compiler_args", "")
+            if self.vllm_config.additional_config
+            else ""
+        )
+        if _extra_cc_args:
+            from vllm_neuron.compile.backend import _parse_compiler_args
+            self.compile_options["compiler_args"] += _parse_compiler_args(_extra_cc_args)
 
         # Check for debug mode environment variable
         # Set VLLM_NEURON_DEBUG_MODE=1 to disable fullgraph for debugging (allows print statements)
@@ -2929,6 +2943,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             bucket_size, kv_segment_size
         )
         compile_start = time.perf_counter()
+        self._pregather_decode_kv(warmup_kwargs.get("attn_metadata"))
         if self._tensor_replacer is not None:
             set_active_context(
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
@@ -3150,6 +3165,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_enabled=spec_decode_enabled,
             ctx_bucket=ctx_bucket,
         )
+        self._pregather_decode_kv(kwargs.get("attn_metadata"))
         try:
             _ = self.capture_backend_model(**kwargs)
         except CaptureComplete:
@@ -3170,6 +3186,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 decode_token_threshold=1,
                 ctx_bucket=ctx_bucket,
             )
+            self._pregather_decode_kv(kwargs.get("attn_metadata"))
             try:
                 _ = self.capture_backend_model(**kwargs)
             except CaptureComplete:
@@ -3236,6 +3253,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             ctx_bucket=ctx_bucket,
         )
         compile_start = time.perf_counter()
+        self._pregather_decode_kv(kwargs.get("attn_metadata"))
         if self._tensor_replacer is not None:
             set_active_context(
                 self._tensor_replacer.warmup_context(
@@ -3277,6 +3295,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 ctx_bucket=ctx_bucket,
             )
             compile_start = time.perf_counter()
+            self._pregather_decode_kv(kwargs.get("attn_metadata"))
             if self._tensor_replacer is not None:
                 set_active_context(
                     self._tensor_replacer.warmup_context(
@@ -4080,6 +4099,56 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         return inputs_embeds, is_token_ids
 
+    def _pregather_decode_kv(self, attn_metadata: dict | None) -> None:
+        """Inject kc/vc tensors into attn_metadata for Gemma4 decode.
+
+        Called before every self.model(**kwargs) invocation — both warmup (tracing)
+        and actual inference — so the compiled graph receives kc/vc as ordinary
+        inputs instead of doing self.k_cache[block_table] inside the NEFF.
+
+        Background: k_cache is a cross-dtype storage view (int8 raw storage
+        reinterpreted as bfloat16) on neuron:0.  PyTorch's fancy indexing
+        k_cache[bt] fails at host time with "Expected self.dtype() == dst.dtype()"
+        because the advanced-indexing copy_ path sees storage.dtype=int8 while the
+        tensor's logical dtype is bfloat16.  Using torch.zeros of the correct shape
+        avoids the dtype error while still eliminating the 629 MB intermediate from
+        the NEFF (which caused NCC_EOOM002).
+
+        Is a no-op for prefill or when self._kv_caches is empty.
+        """
+        if not attn_metadata or not self._kv_caches:
+            return
+        first_meta = next(iter(attn_metadata.values()))
+        if first_meta["max_query_len"] > first_meta["decode_token_threshold"]:
+            return  # prefill — no pre-gather needed
+
+        # Layers within a KV-cache group share one attn_metadata dict.
+        # We need per-layer copies so each layer carries its own kc/vc.
+        seen: dict[int, dict] = {}  # id(original_meta) -> original dict
+        for layer_name, meta in list(attn_metadata.items()):
+            if layer_name not in self._kv_caches:
+                continue
+            mid = id(meta)
+            if mid not in seen:
+                seen[mid] = meta  # record original before any copy is made
+            # Per-layer shallow copy so kc/vc don't overwrite each other.
+            layer_meta = dict(seen[mid])
+            k_cache, v_cache = self._kv_caches[layer_name]
+            bt = layer_meta["block_table_tensor"][
+                :, : layer_meta["max_blocks_per_seq"]
+            ]
+            B, max_blocks = bt.shape
+            nkv, block_size, hd = k_cache.shape[1], k_cache.shape[2], k_cache.shape[3]
+            layer_meta["kc"] = torch.zeros(
+                B, max_blocks, nkv, block_size, hd,
+                dtype=k_cache.dtype, device=k_cache.device,
+            )
+            layer_meta["vc"] = torch.zeros(
+                B, max_blocks, nkv, block_size, hd,
+                dtype=v_cache.dtype, device=v_cache.device,
+            )
+            attn_metadata[layer_name] = layer_meta
+
     def _execute_model_forward(
         self,
         input_ids: torch.Tensor,
@@ -4193,6 +4262,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     dtype=torch.bool,
                     device=self.device,
                 )
+
+        self._pregather_decode_kv(attn_metadata)
 
         # Execute model on Neuron device (compiled with vllm_neuron backend)
         if self._tensor_replacer is not None:
@@ -5211,6 +5282,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
                 )
+
+        # Save per-layer kv_caches for decode KV pre-gather in _execute_model_forward.
+        self._kv_caches = kv_caches
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)

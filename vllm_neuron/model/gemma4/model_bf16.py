@@ -343,32 +343,33 @@ class Gemma4Attention(nn.Module):
 
     def _attn_decode(self, q, positions, attn_metadata):
         meta = attn_metadata[self._layer_name()]
-        block_table = meta["block_table_tensor"]
-        block_size = meta["block_size"]
-        B = block_table.shape[0]
+        # kc/vc are pre-gathered by the runner (outside torch.compile) before this
+        # model call, then passed here via attn_metadata.  This avoids
+        # self.k_cache[block_table] inside the compiled graph: that gather forces
+        # neuronx-cc to create a full-pool intermediate (~629 MB per layer) which
+        # drives the decode NEFF past the 24 GB NCC_EOOM002 HBM limit.
+        kc = meta["kc"]  # [B, max_blocks, nkv, block_size, hd] — pre-gathered
+        vc = meta["vc"]
+        B, max_blocks, nkv, block_size, _ = kc.shape
+        S_ctx = max_blocks * block_size
         T = q.shape[0]
         S_dec = T // B
         hd = self.head_dim
         nqh = self.q_heads_per_rank
-        nkv = self.kv_heads_per_rank
         g = self.num_kv_groups
-        S_ctx = block_table.shape[1] * block_size
 
         if _STUB_ATTN:
             return q.view(B, S_dec, nqh, hd).view(T, nqh, hd)
 
-        # Gather paged KV: cache [num_blocks, nkv, block_size, hd]
-        kc = self.k_cache[block_table]  # [B, max_blocks, nkv, block_size, hd]
-        vc = self.v_cache[block_table]
         kc = kc.permute(0, 2, 1, 3, 4).reshape(B, nkv, S_ctx, hd)
         vc = vc.permute(0, 2, 1, 3, 4).reshape(B, nkv, S_ctx, hd)
         kc = kc.repeat_interleave(g, dim=1)  # [B, nqh, S_ctx, hd]
         vc = vc.repeat_interleave(g, dim=1)
 
         q_ = q.view(B, S_dec, nqh, hd).permute(0, 2, 1, 3)  # [B, nqh, S_dec, hd]
-        scores = torch.matmul(q_, kc.transpose(2, 3)) * self.scaling  # [B,nqh,S_dec,S_ctx]
+        scores = torch.matmul(q_, kc.transpose(2, 3)) * self.scaling
 
-        qpos = positions.view(B, S_dec).to(torch.float32)  # [B, S_dec]
+        qpos = positions.view(B, S_dec).to(torch.float32)
         kidx = torch.arange(S_ctx, device=q.device, dtype=torch.float32).view(1, 1, S_ctx)
         qp = qpos.view(B, S_dec, 1)
         allowed = kidx <= qp
@@ -376,10 +377,10 @@ class Gemma4Attention(nn.Module):
             allowed = allowed & ((qp - kidx) < self.sliding_window)
         # Additive mask: avoids scalar-broadcast torch.where which triggers
         # neuronx-cc NCC_IGCA024 at large head_dim (256/512).
-        mask = allowed.logical_not().to(torch.float32) * -1e30  # [B, S_dec, S_ctx]
-        scores = scores.to(torch.float32) + mask.unsqueeze(1)  # [B, 1, S_dec, S_ctx]
+        mask = allowed.logical_not().to(torch.float32) * -1e30
+        scores = scores.to(torch.float32) + mask.unsqueeze(1)
         attn = torch.softmax(scores, dim=-1).to(vc.dtype)
-        out = torch.matmul(attn, vc)  # [B, nqh, S_dec, hd]
+        out = torch.matmul(attn, vc)
         out = out.permute(0, 2, 1, 3).reshape(T, nqh, hd)
         return out
 

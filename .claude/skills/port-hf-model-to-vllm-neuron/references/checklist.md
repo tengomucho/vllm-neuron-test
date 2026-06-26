@@ -59,3 +59,19 @@ carry over between model families.
       replicated per rank unless EP is enabled → raise TP (shards weights/intermediate) or
       implement expert parallelism (ep_degree) to shard the expert count. Roughly weights/rank
       ≈ total_params·2 / TP bytes.
+- [ ] **Decode HBM OOM (NCC_EOOM002)**: `self.k_cache[block_table]` inside the compiled decode
+      graph forces neuronx-cc to create a full-pool intermediate (~num_blocks × nkv × block_size × hd).
+      For 26B at TP=8 this is ~629 MB per layer; 30 layers × 2 (k+v) = 37.6 GB → OOM.
+      Fix: lift the gather OUT of the compiled graph. In `_attn_decode`, read `kc`/`vc` from
+      `attn_metadata["kc"]`/`["vc"]` (small [B, max_blocks, nkv, block_size, hd] tensors) which the
+      runner injects before each model call via `_pregather_decode_kv()`. `_write_cache` (index_put_,
+      write-only) stays inside the graph — write path doesn't need to load the full pool.
+      Call `_pregather_decode_kv()` before EVERY `self.model(...)` / `self.capture_backend_model(...)`
+      invocation — including warmup_prefill, both decode calls in warmup_decode, AND both calls in
+      extract_decode_graphs — because dynamo traces on the first call to each function.
+- [ ] **Cross-dtype k_cache view** (non-native/XLA backend): k_cache is int8 raw storage reinterpreted
+      as bfloat16 on `neuron:0`. Fancy indexing `k_cache[bt]` from Python host fails with
+      "Expected self.dtype() == dst.dtype()". Use `torch.zeros(shape, dtype=k_cache.dtype,
+      device=k_cache.device)` for graph-capture warmup (shape is all that matters for tracing).
+      For correct runtime output, implement a linear context buffer inside the model instead
+      (see next-steps.md "Decode KV pre-gather limitation").
