@@ -62,16 +62,20 @@ carry over between model families.
 - [ ] **Decode HBM OOM (NCC_EOOM002)**: `self.k_cache[block_table]` inside the compiled decode
       graph forces neuronx-cc to create a full-pool intermediate (~num_blocks × nkv × block_size × hd).
       For 26B at TP=8 this is ~629 MB per layer; 30 layers × 2 (k+v) = 37.6 GB → OOM.
-      Fix: lift the gather OUT of the compiled graph. In `_attn_decode`, read `kc`/`vc` from
-      `attn_metadata["kc"]`/`["vc"]` (small [B, max_blocks, nkv, block_size, hd] tensors) which the
-      runner injects before each model call via `_pregather_decode_kv()`. `_write_cache` (index_put_,
-      write-only) stays inside the graph — write path doesn't need to load the full pool.
-      Call `_pregather_decode_kv()` before EVERY `self.model(...)` / `self.capture_backend_model(...)`
-      invocation — including warmup_prefill, both decode calls in warmup_decode, AND both calls in
-      extract_decode_graphs — because dynamo traces on the first call to each function.
-- [ ] **Cross-dtype k_cache view** (non-native/XLA backend): k_cache is int8 raw storage reinterpreted
-      as bfloat16 on `neuron:0`. Fancy indexing `k_cache[bt]` from Python host fails with
-      "Expected self.dtype() == dst.dtype()". Use `torch.zeros(shape, dtype=k_cache.dtype,
-      device=k_cache.device)` for graph-capture warmup (shape is all that matters for tracing).
-      For correct runtime output, implement a linear context buffer inside the model instead
-      (see next-steps.md "Decode KV pre-gather limitation").
+      **Fix (linear context buffer)**: Add per-layer `k_ctx`/`v_ctx` tensors of shape
+      `[max_ctx_len + 1, nkv, hd]` to the attention module (the +1 is a scratch slot for padding).
+      In `bind_kv_cache`, allocate these on the same device/dtype as the paged cache.
+      In `_write_cache`, fill them using logical `positions` as the scatter index (NOT
+      `slot_mapping` which is a PHYSICAL block-pool address and can be >> max_ctx_len).
+      In `_attn_decode`, read `k_ctx[:max_ctx_len]` directly — no gather inside the NEFF.
+- [ ] **Padding token KV corruption**: Padding tokens have `slot_mapping == PAD_SLOT_ID (-1)`
+      but `positions == last_real_token_position`. Without a guard, `_write_cache` overwrites
+      real token KVs in k_ctx, producing degenerate repetitive output at decode.
+      Fix: `is_pad = (slot_mapping == -1)`; compute
+      `ctx_pos = torch.where(is_pad, torch.full_like(positions, max_ctx_len), positions.clamp(max=max_ctx_len-1)).long()`
+      and scatter-write to `ctx_pos`. The scratch element at index `max_ctx_len` is never
+      read by `_attn_decode` (which reads `k_ctx[:max_ctx_len]`).
+- [ ] **Decode warmup positions OOB**: `_build_decode_synthetic_inputs` uses `context_len=256`
+      by default → `positions=[255]` during warmup. If `max_ctx_len=64`, writing to
+      k_ctx[255] would OOB. The `clamp(max=max_ctx_len-1)` in the ctx_pos computation above
+      prevents this — verify it is in place before the `torch.where`.
