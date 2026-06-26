@@ -4,7 +4,7 @@ Gemma4 (text decoder) BF16 implementation for the Neuron backend.
 
 Correctness-first port. Notable Gemma4 traits handled here:
   - Every layer runs a DENSE MLP and a 128-expert MoE in parallel and sums them.
-  - 7 RMSNorms per layer (Gemma `(1 + weight)` form, fp32).
+  - 7 RMSNorms per layer (Gemma4 plain `* weight` form, fp32 accumulation).
   - Hybrid attention: sliding-window layers (head_dim 256, 8 KV heads, default
     RoPE) and full-attention layers (head_dim 512, 2 KV heads, proportional /
     partial RoPE, K reused as V via attention_k_eq_v).
@@ -14,10 +14,16 @@ Correctness-first port. Notable Gemma4 traits handled here:
 Parallelism (v1): pure tensor parallel, NO sequence parallelism. Hidden states
 are replicated across ranks; sharded matmuls are followed by all_reduce.
 Attention uses plain torch ops (head_dim > 128 rules out the flash kernel).
+
+Env-var overrides (bisect / debug):
+  GEMMA4_STUB_ATTN=1   Replace attention computation with a zero tensor (no QK^T
+                        or softmax); use to confirm whether attention is the
+                        neuronx-cc NCC_IGCA024 trigger before the full fix lands.
 """
 
 import logging
 import math
+import os as _os
 
 import nki.language as nl
 import torch
@@ -50,6 +56,9 @@ from .config import Gemma4Config
 from . import weight_loaders as WL
 
 logger = logging.getLogger(__name__)
+
+# Set GEMMA4_STUB_ATTN=1 to replace attention with zeros for bisect testing.
+_STUB_ATTN = _os.environ.get("GEMMA4_STUB_ATTN", "0") == "1"
 
 
 # =============================================================================
@@ -303,6 +312,9 @@ class Gemma4Attention(nn.Module):
 
     def _attn_prefill(self, q, k, v, positions):
         # q: [T, nqh, hd]; k, v: [T, nkv, hd]
+        if _STUB_ATTN:
+            return torch.zeros_like(q)
+
         T = q.shape[0]
         g = self.num_kv_groups
         kg = k.repeat_interleave(g, dim=1)  # [T, nqh, hd]
@@ -321,11 +333,9 @@ class Gemma4Attention(nn.Module):
         allowed = kj <= qi  # causal
         if self.sliding_window is not None:
             allowed = allowed & ((qi - kj) < self.sliding_window)
-        mask = torch.where(
-            allowed,
-            torch.zeros((), device=q.device, dtype=torch.float32),
-            torch.full((), -1e30, device=q.device, dtype=torch.float32),
-        )
+        # Additive mask: avoids scalar-broadcast torch.where which triggers
+        # neuronx-cc NCC_IGCA024 at large head_dim (256/512).
+        mask = allowed.logical_not().to(torch.float32) * -1e30  # [T, T]
         scores = scores.to(torch.float32) + mask.unsqueeze(0)
         attn = torch.softmax(scores, dim=-1).to(v_.dtype)
         out = torch.matmul(attn, v_)  # [nqh, T, hd]
@@ -344,6 +354,9 @@ class Gemma4Attention(nn.Module):
         g = self.num_kv_groups
         S_ctx = block_table.shape[1] * block_size
 
+        if _STUB_ATTN:
+            return q.view(B, S_dec, nqh, hd).view(T, nqh, hd)
+
         # Gather paged KV: cache [num_blocks, nkv, block_size, hd]
         kc = self.k_cache[block_table]  # [B, max_blocks, nkv, block_size, hd]
         vc = self.v_cache[block_table]
@@ -361,12 +374,10 @@ class Gemma4Attention(nn.Module):
         allowed = kidx <= qp
         if self.sliding_window is not None:
             allowed = allowed & ((qp - kidx) < self.sliding_window)
-        mask = torch.where(
-            allowed,
-            torch.zeros((), device=q.device, dtype=torch.float32),
-            torch.full((), -1e30, device=q.device, dtype=torch.float32),
-        ).unsqueeze(1)  # [B,1,S_dec,S_ctx]
-        scores = scores.to(torch.float32) + mask
+        # Additive mask: avoids scalar-broadcast torch.where which triggers
+        # neuronx-cc NCC_IGCA024 at large head_dim (256/512).
+        mask = allowed.logical_not().to(torch.float32) * -1e30  # [B, S_dec, S_ctx]
+        scores = scores.to(torch.float32) + mask.unsqueeze(1)  # [B, 1, S_dec, S_ctx]
         attn = torch.softmax(scores, dim=-1).to(vc.dtype)
         out = torch.matmul(attn, vc)  # [B, nqh, S_dec, hd]
         out = out.permute(0, 2, 1, 3).reshape(T, nqh, hd)
@@ -547,11 +558,17 @@ class Gemma4Experts(nn.Module):
                 h_in, (0, self.hidden_pad - self.hidden_size)
             )
 
-        if not is_prefill:
-            # Decode: the moe_cte blockwise mapping is prefill-only (it divides
-            # by total_tokens//16, which is 0 for the few decode tokens). Use a
-            # vectorized local-expert computation instead (cheap for few tokens),
-            # equivalent to moe_cte POST_SCALE.
+        num_tokens = expert_input.shape[0]
+
+        # Use the vectorized einsum path for decode OR for small prefill buckets.
+        # The moe_cte NKI kernel tiles the token dimension in 128-element NKI
+        # partitions — it asserts num_tokens >= 128. For decode (always few tokens)
+        # and for small prefill buckets (e.g. the 64-token test bucket), fall back
+        # to the einsum which has no such constraint. In production, prefill buckets
+        # are ≥ 128 so moe_cte is used there.
+        _NKI_PARTITION = 128
+        if not is_prefill or num_tokens < _NKI_PARTITION:
+            # Decode / small-prefill: vectorized local-expert einsum, POST_SCALE.
             gu = self.gate_up_proj_weight.reshape(
                 self.num_local_experts, self.hidden_pad, 2, self.inter_per_rank
             )
@@ -566,8 +583,6 @@ class Gemma4Experts(nn.Module):
             if self.world_size > 1:
                 output = self.tp_group.all_reduce(output)
             return output
-
-        num_tokens = expert_input.shape[0]
         (
             expert_affinities_masked,
             token_position_to_id,
