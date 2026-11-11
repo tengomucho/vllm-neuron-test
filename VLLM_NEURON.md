@@ -10,7 +10,7 @@ for that prototype, to match upstream vLLM's GPU experience
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
-- Prototype code: branch `transformers-backend` of `~/Dev/vllm-neuron`, 4
+- Prototype code: branch `transformers-backend` of `~/Dev/vllm-neuron`, 5
   commits on top of `main` (`a080ebf`). The same commits are in
   [`patches/vllm-neuron-transformers-backend/`](patches/vllm-neuron-transformers-backend/)
   (`git am`-able).
@@ -25,10 +25,11 @@ for that prototype, to match upstream vLLM's GPU experience
 - Verified on device against HF transformers. Every token generated is HF
   fp32's argmax or within 0.08 logits of it, the same accuracy as vLLM
   Neuron's native implementations:
-  - Llama (TinyLlama) at TP=1 and TP=2, and Qwen3-0.6B at TP=1 and TP=4, with
+  - Llama (TinyLlama, Llama-3.2-1B) and Qwen3-0.6B, at TP 1, 2 and 4, with
     `--model-impl transformers`;
-  - **Granite-3.1-2b and Gemma-3-270m, which vLLM Neuron has no
-    implementation of**, served automatically through the backend;
+  - **Granite-3.1-2b, Gemma-3-270m, Qwen2.5-0.5B and SmolLM3-3B, which vLLM
+    Neuron has no implementation of**, served automatically through the
+    backend;
   - `vllm serve` plus OpenAI chat completions.
 - Speed: decode is ~25-30% slower than the native NKI implementation at
   TinyLlama size. Attention uses plain PyTorch ops, so NKI attention kernels
@@ -93,6 +94,9 @@ teacher-forced re-scoring):
 | Qwen3-0.6B | yes (Qwen3) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 5 | 0.036 |
 | granite-3.1-2b-instruct | **no** | default (auto fallback) | 1 | 1 exact, 1 near-tie at token 3 | 0.063 |
 | gemma-3-270m-it | **no** | default (auto fallback) | 1 | **exact** | 0.000 |
+| Qwen2.5-0.5B (QKV bias) | **no** | default (auto fallback) | 2 | **exact** | 0.000 |
+| SmolLM3-3B (NoPE layers) | **no** | default (auto fallback) | 4 | 1 exact, 1 near-tie at token 2 | 0.011 |
+| Llama-3.2-1B-Instruct (tied emb.) | yes (Llama) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 7 | 0.054 |
 
 "Max fp32 logit gap" comes from
 [`scripts/teacher_forced_logprobs.py`](scripts/teacher_forced_logprobs.py),
@@ -167,6 +171,8 @@ prototype implements that contract around an HF model.
   - `rowwise` linears are sliced on input features, followed by
     `get_tp_group().all_reduce`, which compiles into the NEFF;
   - `replicated_with_grad_allreduce` modules are left as they are;
+  - with fewer KV heads than ranks, KV heads are replicated, as vLLM does:
+    each rank keeps the KV head of its query heads;
   - embeddings and the LM head stay replicated.
 
 `vllm_neuron/model/registry.py`:
@@ -179,9 +185,14 @@ prototype implements that contract around an HF model.
   the Transformers backend instead, like upstream's `model_impl="auto"`
   fallback.
 
-`test/unit/model/test_transformers_backend.py` checks the attention function
-on CPU against reference causal attention: padded prefill, batched decode with
-a padded row, sliding window, and segmented prefill.
+CPU unit tests (`VLLM_NEURON_CPU_MODE=1 pytest test/unit/model/`):
+
+- `test_transformers_backend.py` checks the attention function against
+  reference causal attention: padded prefill, batched decode with a padded
+  row, sliding window, and segmented prefill.
+- `test_transformers_backend_tp.py` shards a tiny random Llama over simulated
+  ranks (threads, in-process all-reduce) and checks its logits against the
+  unsharded model at TP 2, 4 and 8, with plain and replicated KV heads.
 
 Commits (in `patches/vllm-neuron-transformers-backend/`):
 
@@ -189,6 +200,7 @@ Commits (in `patches/vllm-neuron-transformers-backend/`):
 2. `feat(model): shard the Transformers backend from the HF tp_plan`
 3. `feat(model): serve unimplemented archs with the Transformers backend`
 4. `test(model): check the Transformers backend attention on CPU`
+5. `feat(model): replicate KV heads when TP exceeds them`
 
 ## 4. Issues found
 
@@ -264,8 +276,8 @@ python hf_cpu_reference.py --model unsloth/gemma-3-270m-it --out /tmp/ref.json &
 echo "qwen3 Qwen/Qwen3-0.6B transformers 4" | bash run_matrix.sh /tmp
 # Online serving:
 bash serve_check.sh /tmp/serve.log Qwen/Qwen3-0.6B --model-impl transformers
-# Attention unit tests (CPU), from ~/Dev/vllm-neuron:
-VLLM_NEURON_CPU_MODE=1 python -m pytest -q test/unit/model/test_transformers_backend.py
+# Unit tests (CPU: attention, TP sharding), from ~/Dev/vllm-neuron:
+VLLM_NEURON_CPU_MODE=1 python -m pytest -q test/unit/model/
 # Plain transformers on torch-neuronx (leave TORCH_DEVICE_BACKEND_AUTOLOAD unset):
 env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_transformers.py
 ```
@@ -279,9 +291,10 @@ env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_
     output projections, so it doesn't fit the attention interface);
   - fused QKV and gate/up projections, and a vocab-sharded LM head
     (`ColumnParallelLinear`), as upstream's fusers do.
-- **TP**: heads must be divisible by the TP size (no KV-head replication yet).
-  Still missing: `packed_colwise` (fused gate_up/qkv, e.g. Phi3),
-  `colwise_gather_output`, the MoE/EP styles, and sequence parallelism.
+- **TP**: the number of attention heads must be divisible by the TP size, and
+  KV heads and TP size must divide one another. Still missing:
+  `packed_colwise` (fused gate_up/qkv, e.g. Phi3), `colwise_gather_output`,
+  the MoE/EP styles, and sequence parallelism.
 - **Sliding window**: a full-length cache is allocated and the window is
   applied by masking. Declaring `sliding_window_size` in the KV spec would
   save memory.
