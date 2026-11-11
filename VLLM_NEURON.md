@@ -10,7 +10,7 @@ for that prototype, to match upstream vLLM's GPU experience
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
-- Prototype code: branch `transformers-backend` of `~/Dev/vllm-neuron`, 5
+- Prototype code: branch `transformers-backend` of `~/Dev/vllm-neuron`, 6
   commits on top of `main` (`a080ebf`). The same commits are in
   [`patches/vllm-neuron-transformers-backend/`](patches/vllm-neuron-transformers-backend/)
   (`git am`-able).
@@ -27,9 +27,10 @@ for that prototype, to match upstream vLLM's GPU experience
   Neuron's native implementations:
   - Llama (TinyLlama, Llama-3.2-1B) and Qwen3-0.6B, at TP 1, 2 and 4, with
     `--model-impl transformers`;
-  - **Granite-3.1-2b, Gemma-3-270m, Qwen2.5-0.5B and SmolLM3-3B, which vLLM
-    Neuron has no implementation of**, served automatically through the
-    backend;
+  - **Granite-3.1-2b, Gemma-3-270m, Qwen2.5-0.5B, SmolLM3-3B and a tiny
+    Qwen3-MoE, which vLLM Neuron has no implementation of**, served
+    automatically through the backend (Model Runner V2 for the dense models,
+    V1 for the MoE);
   - `vllm serve` plus OpenAI chat completions.
 - Speed: decode is 10-30% slower than the native NKI implementation at
   TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
@@ -98,6 +99,7 @@ teacher-forced re-scoring):
 | SmolLM3-3B (NoPE layers) | **no** | default (auto fallback) | 4 | 1 exact, 1 near-tie at token 2 | 0.011 |
 | Llama-3.2-1B-Instruct (tied emb.) | yes (Llama) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 7 | 0.054 |
 | TinyLlama-1.1B (4 KV heads, replicated) | yes (Llama) | `--model-impl transformers` | 8 | 1 exact, 1 near-tie at token 8 | 0.039 |
+| tiny-random Qwen3-MoE (8 experts, top-2) | **no** | default (auto fallback), Model Runner V1 | 1 | 1 exact, 1 near-tie at token 9 (vs fp32) | 0.055 |
 
 "Max fp32 logit gap" comes from
 [`scripts/teacher_forced_logprobs.py`](scripts/teacher_forced_logprobs.py),
@@ -182,6 +184,13 @@ prototype implements that contract around an HF model.
   - with fewer KV heads than ranks, KV heads are replicated, as vLLM does:
     each rank keeps the KV head of its query heads;
   - embeddings and the LM head stay replicated.
+- **Mixture of experts**: MoE configs request transformers'
+  `experts_implementation="batched_mm"`, which gathers each token's expert
+  weights and runs a batched matmul. Its shapes do not depend on the routing,
+  so it compiles into a static graph, unlike the default `grouped_mm` and its
+  `eager` fallback. Memory grows with tokens × top-k × expert size, so this
+  only suits small models; a Neuron experts function (`ExpertsInterface`)
+  using vLLM Neuron's MoE kernels is the scalable path.
 
 `vllm_neuron/model/registry.py`:
 
@@ -209,6 +218,7 @@ Commits (in `patches/vllm-neuron-transformers-backend/`):
 3. `feat(model): serve unimplemented archs with the Transformers backend`
 4. `test(model): check the Transformers backend attention on CPU`
 5. `feat(model): replicate KV heads when TP exceeds them`
+6. `feat(model): run MoE models with batched_mm experts`
 
 ## 4. Issues found
 
@@ -309,10 +319,11 @@ env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_
 - **Sliding window**: a full-length cache is allocated and the window is
   applied by masking. Declaring `sliding_window_size` in the KV spec would
   save memory.
-- **MoE**: transformers 5.22 has an `ExpertsInterface`, analogous to the
-  attention one (`batched_mm`, `grouped_mm`, ...). A static-shape Neuron
-  experts function would plug in the same way. MoE models run on Model
-  Runner V1.
+- **MoE**: works with `batched_mm` on a tiny model only. For real MoE sizes,
+  register a Neuron experts function in transformers' `ExpertsInterface`,
+  the counterpart of the attention one, backed by vLLM Neuron's MoE kernels
+  (`moe_cte`/`moe_tkg`). Also missing: expert parallelism, and TP of the
+  experts (the `moe_tp_experts`/`ep_*` plan styles).
 - **Not covered**: multimodal (`TransformersMultiModalForCausalLM`), pooling,
   speculative decoding, quantization, LoRA, and prefix caching / chunked
   prefill on device (segmented prefill is only unit-tested on CPU).
