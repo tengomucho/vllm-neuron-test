@@ -31,9 +31,9 @@ for that prototype, to match upstream vLLM's GPU experience
     Neuron has no implementation of**, served automatically through the
     backend;
   - `vllm serve` plus OpenAI chat completions.
-- Speed: decode is ~25-30% slower than the native NKI implementation at
-  TinyLlama size. Attention uses plain PyTorch ops, so NKI attention kernels
-  are the next step.
+- Speed: decode is 10-30% slower than the native NKI implementation at
+  TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
+  ops, so NKI attention kernels are the next step.
 - Found along the way, worth reporting to AWS:
   - the public torch-neuronx 2.33 wheels require glibc 2.43;
   - libtorch-neuronx-lite and vllm-neuron disagree on the default compile
@@ -97,6 +97,7 @@ teacher-forced re-scoring):
 | Qwen2.5-0.5B (QKV bias) | **no** | default (auto fallback) | 2 | **exact** | 0.000 |
 | SmolLM3-3B (NoPE layers) | **no** | default (auto fallback) | 4 | 1 exact, 1 near-tie at token 2 | 0.011 |
 | Llama-3.2-1B-Instruct (tied emb.) | yes (Llama) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 7 | 0.054 |
+| TinyLlama-1.1B (4 KV heads, replicated) | yes (Llama) | `--model-impl transformers` | 8 | 1 exact, 1 near-tie at token 8 | 0.039 |
 
 "Max fp32 logit gap" comes from
 [`scripts/teacher_forced_logprobs.py`](scripts/teacher_forced_logprobs.py),
@@ -112,12 +113,19 @@ The native TinyLlama run scores 0.039 by the same measure.
 `finish_reason: stop`.
 
 **Native vs Transformers backend** (TinyLlama, TP=2, 2 prompts × 128 tokens,
-max_model_len 256, steady state):
+steady state):
 
-| | generate | per decode step | max fp32 logit gap | mean / max abs(logprob − HF) |
-|---|---|---|---|---|
-| native (`LlamaForCausalLM`, NKI kernels) | 0.8-1.0 s | ~7 ms | 0.047 | 0.004-0.008 / 0.060 |
-| Transformers backend | 1.1-1.2 s | ~9 ms | 0.058 | 0.005-0.009 / 0.075 |
+| | max_model_len | generate | per decode step | max fp32 logit gap | mean / max abs(logprob − HF) |
+|---|---|---|---|---|---|
+| native (`LlamaForCausalLM`, NKI kernels) | 256 | 0.8-1.0 s | ~7 ms | 0.047 | 0.004-0.008 / 0.060 |
+| Transformers backend | 256 | 1.1-1.2 s | ~9 ms | 0.058 | 0.005-0.009 / 0.075 |
+| native | 2048 | 1.0 s | ~8 ms | — | — |
+| Transformers backend | 2048 | 1.1 s | ~9 ms | 0.047 | 0.004-0.008 / 0.049 |
+
+At this model size the gap stays at 10-30%, and it does not grow from 256 to
+2048 context, even though the backend gathers the whole block table on every
+decode step: fixed per-step costs dominate. Larger models and much longer
+contexts are untested.
 
 **Compile and start-up:**
 
@@ -284,8 +292,11 @@ env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_
 
 ## 6. Gaps and next steps
 
-- **Performance**: decode gathers the whole block table (max_model_len) of
-  each sequence and computes attention with plain ops. Next:
+- **Performance**: decode gathers each sequence's whole block table and
+  computes attention with plain ops. vLLM Neuron's existing
+  `decode_context_length_buckets` option trims the block table to the decode
+  bucket, so the gather then reads only that bucket's blocks, not
+  max_model_len (untested with this backend). Next:
   - NKI attention kernels: `flash_attention` for prefill, and a paged decode
     kernel that takes Q/K/V (the current `attention_decode` fuses the QKV and
     output projections, so it doesn't fit the attention interface);
