@@ -1,0 +1,157 @@
+From 3a55186d9a7db34bcc9054410b70e6830493f52f Mon Sep 17 00:00:00 2001
+From: Alvaro Moran <alvaro.moran@huggingface.co>
+Date: Wed, 11 Nov 2026 00:03:02 +0000
+Subject: [PATCH 4/4] test(model): check the Transformers backend attention on
+ CPU
+
+Compare the paged-KV attention function with reference causal attention
+for a padded prefill, batched decode with a padded batch row (block table
+-1, slot -1), a sliding window, and a segmented prefill reading the first
+chunk back from the cache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ test/unit/model/test_transformers_backend.py | 131 +++++++++++++++++++
+ 1 file changed, 131 insertions(+)
+ create mode 100644 test/unit/model/test_transformers_backend.py
+
+diff --git a/test/unit/model/test_transformers_backend.py b/test/unit/model/test_transformers_backend.py
+new file mode 100644
+index 0000000..fbbf2ef
+--- /dev/null
++++ b/test/unit/model/test_transformers_backend.py
+@@ -0,0 +1,131 @@
++"""CPU checks of the Transformers-backend attention over the vLLM Neuron paged KV cache.
++
++Run:  VLLM_NEURON_CPU_MODE=1 pytest -q test/unit/model/test_transformers_backend.py
++"""
++
++import pytest
++import torch
++from torch import nn
++
++from vllm_neuron.model.transformers.model import neuron_paged_attention_forward
++
++HQ, HKV, D, BLOCK_SIZE, NUM_BLOCKS = 4, 2, 8, 4, 16
++
++
++def reference(q, k, v, window=None):
++    """Causal (optionally sliding-window) GQA attention. q [Hq, S, D], k/v [Hkv, S, D]."""
++    s = q.shape[1]
++    k = k.repeat_interleave(HQ // HKV, 0)
++    v = v.repeat_interleave(HQ // HKV, 0)
++    i = torch.arange(s)
++    allowed = i[None, :] <= i[:, None]
++    if window is not None:
++        allowed &= i[None, :] > i[:, None] - window
++    scores = (q @ k.transpose(-1, -2)) * D**-0.5
++    return (
++        torch.softmax(scores.masked_fill(~allowed, float("-inf")), -1) @ v
++    )  # [Hq, S, D]
++
++
++def slots(blocks, start, n):
++    pos = torch.arange(start, start + n)
++    return torch.tensor(blocks)[pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
++
++
++def make_module():
++    module = nn.Module()
++    module.layer_idx = 0
++    module.k_cache = torch.zeros(NUM_BLOCKS, HKV, BLOCK_SIZE, D)
++    module.v_cache = torch.zeros(NUM_BLOCKS, HKV, BLOCK_SIZE, D)
++    return module
++
++
++def meta(slot_mapping, block_table, max_query_len, kv_segment_size=0):
++    return {
++        "layers.0.self_attn": {
++            "slot_mapping": slot_mapping,
++            "block_table_tensor": block_table,
++            "block_size": BLOCK_SIZE,
++            "max_query_len": max_query_len,
++            "decode_token_threshold": 1,
++            "kv_segment_size": kv_segment_size,
++        }
++    }
++
++
++def run(module, q, k, v, md, positions, window=None):
++    out, _ = neuron_paged_attention_forward(
++        module,
++        q[None],
++        k[None],
++        v[None],
++        None,
++        sliding_window=window,
++        neuron_attn_metadata=md,
++        neuron_positions=positions,
++    )
++    return out[0].transpose(0, 1)  # [Hq, T, D]
++
++
++@pytest.mark.parametrize("window", [None, 3])
++def test_prefill_then_batched_decode(window):
++    torch.manual_seed(0)
++    module = make_module()
++    blocks_a, blocks_b = [3, 7, 9], [5, 11, 2]
++    seq_len, prompt_len, padded = 9, 6, 8
++    qa, ka, va = (torch.randn(h, seq_len, D) for h in (HQ, HKV, HKV))
++    qb, kb, vb = (torch.randn(h, seq_len, D) for h in (HQ, HKV, HKV))
++
++    # Prefill each sequence: real tokens first, then padding (slot -1).
++    for q, k, v, blocks in ((qa, ka, va, blocks_a), (qb, kb, vb, blocks_b)):
++        pad = padded - prompt_len
++        sl = torch.cat([slots(blocks, 0, prompt_len), torch.full((pad,), -1)])
++        pos = torch.cat([torch.arange(prompt_len), torch.zeros(pad, dtype=torch.long)])
++        qp, kp, vp = (
++            torch.cat([t[:, :prompt_len], torch.randn(t.shape[0], pad, D)], 1)
++            for t in (q, k, v)
++        )
++        out = run(
++            module, qp, kp, vp, meta(sl, torch.tensor([blocks]), padded), pos, window
++        )
++        torch.testing.assert_close(
++            out[:, :prompt_len],
++            reference(q[:, :prompt_len], k[:, :prompt_len], v[:, :prompt_len], window),
++        )
++
++    # Decode both sequences, plus a padded batch row (block table -1, slot -1).
++    block_table = torch.tensor([blocks_a, blocks_b, [-1, -1, -1]])
++    for t in range(prompt_len, seq_len):
++        q = torch.stack([qa[:, t], qb[:, t], torch.randn(HQ, D)], 1)
++        k = torch.stack([ka[:, t], kb[:, t], torch.randn(HKV, D)], 1)
++        v = torch.stack([va[:, t], vb[:, t], torch.randn(HKV, D)], 1)
++        sl = torch.cat(
++            [slots(blocks_a, t, 1), slots(blocks_b, t, 1), torch.tensor([-1])]
++        )
++        out = run(
++            module, q, k, v, meta(sl, block_table, 1), torch.tensor([t, t, 0]), window
++        )
++        ref_a = reference(qa[:, : t + 1], ka[:, : t + 1], va[:, : t + 1], window)[:, t]
++        ref_b = reference(qb[:, : t + 1], kb[:, : t + 1], vb[:, : t + 1], window)[:, t]
++        torch.testing.assert_close(out[:, 0], ref_a)
++        torch.testing.assert_close(out[:, 1], ref_b)
++        assert torch.isfinite(out[:, 2]).all()
++
++
++def test_segmented_prefill():
++    """A second prefill chunk attends over the first one through the cache."""
++    torch.manual_seed(0)
++    module = make_module()
++    blocks = [4, 8, 1]
++    q, k, v = (torch.randn(h, 10, D) for h in (HQ, HKV, HKV))
++    run(
++        module,
++        q[:, :4],
++        k[:, :4],
++        v[:, :4],
++        meta(slots(blocks, 0, 4), torch.tensor([blocks]), 4),
++        torch.arange(4),
++    )
++    md = meta(slots(blocks, 4, 6), torch.tensor([blocks]), 6, kv_segment_size=8)
++    out = run(module, q[:, 4:], k[:, 4:], v[:, 4:], md, torch.arange(4, 10))
++    torch.testing.assert_close(out, reference(q, k, v)[:, 4:])
+-- 
+2.43.0
+

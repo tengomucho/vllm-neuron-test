@@ -1,0 +1,141 @@
+From b9d881b51bec33238ccaed8134939c0899d1cd29 Mon Sep 17 00:00:00 2001
+From: Alvaro Moran <alvaro.moran@huggingface.co>
+Date: Wed, 11 Nov 2026 00:02:08 +0000
+Subject: [PATCH 3/4] feat(model): serve unimplemented archs with the
+ Transformers backend
+
+vLLM resolves an architecture that vLLM Neuron has no implementation of
+(Granite, Gemma3, Mistral, ...) to vLLM's own GPU model class, which the
+Neuron runners cannot run. Add registry.resolve_model_cls(), used by both
+model runners: when the resolved class is not a Neuron model, serve the
+decoder model with the Transformers backend, as upstream vLLM does with
+model_impl="auto" for the architectures it has no implementation of. The
+transformers class must support custom attention functions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm_neuron/model/registry.py                 | 38 ++++++++++++++++++-
+ .../vllm/worker/neuron_model_runner.py        |  8 ++--
+ .../vllm/worker/neuron_model_runner_v2.py     |  8 ++--
+ 3 files changed, 43 insertions(+), 11 deletions(-)
+
+diff --git a/vllm_neuron/model/registry.py b/vllm_neuron/model/registry.py
+index 64152e2..f2208c7 100644
+--- a/vllm_neuron/model/registry.py
++++ b/vllm_neuron/model/registry.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++import logging
+ import os
+ 
+ from .llama3 import LlamaForCausalLM
+@@ -9,6 +10,8 @@ from .qwen3_vl import Qwen3VLForConditionalGeneration
+ from .qwen3_asr import Qwen3ASRForConditionalGeneration
+ from .transformers import TransformersForCausalLM
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def get_models() -> list[tuple[str, type]]:
+     """Return a list of available model classes.
+@@ -29,7 +32,8 @@ def get_models() -> list[tuple[str, type]]:
+         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
+         # Transformers modeling backend: what vLLM resolves to with
+-        # --model-impl transformers.
++        # --model-impl transformers (and for architectures it has no
++        # implementation of).
+         ("TransformersForCausalLM", TransformersForCausalLM),
+     ]
+ 
+@@ -48,3 +52,35 @@ def get_models() -> list[tuple[str, type]]:
+         models.append(("SyntheticStackedNeuronModel", SyntheticStackedNeuronModel))
+ 
+     return models
++
++
++def resolve_model_cls(model_config) -> type:
++    """Resolve the class that runs ``model_config`` on Neuron.
++
++    vLLM resolves an architecture that vLLM Neuron has no implementation of to
++    vLLM's own (GPU) model class, which the Neuron runners cannot run. Serve
++    those decoder models with the Transformers modeling backend instead, as
++    vLLM does for the architectures it has no implementation of.
++    """
++    from vllm import ModelRegistry
++
++    model_cls, arch = ModelRegistry.resolve_model_cls(
++        model_config.architecture, model_config=model_config
++    )
++    if hasattr(model_cls, "from_configs") or model_config.runner_type != "generate":
++        return model_cls
++    import transformers
++
++    hf_cls = getattr(transformers, arch, None)
++    if hf_cls is not None and not hf_cls.is_backend_compatible():
++        raise ValueError(
++            f"vLLM Neuron has no implementation of {arch}, and its transformers "
++            "implementation does not support custom attention functions, which the "
++            "Transformers modeling backend needs."
++        )
++    logger.info(
++        "vLLM Neuron has no implementation of %s: serving it with the Transformers "
++        "modeling backend",
++        arch,
++    )
++    return TransformersForCausalLM
+diff --git a/vllm_neuron/vllm/worker/neuron_model_runner.py b/vllm_neuron/vllm/worker/neuron_model_runner.py
+index 4689864..2b95ed8 100644
+--- a/vllm_neuron/vllm/worker/neuron_model_runner.py
++++ b/vllm_neuron/vllm/worker/neuron_model_runner.py
+@@ -21,7 +21,6 @@ from typing import Any, NamedTuple, cast
+ 
+ import numpy as np
+ import torch
+-from vllm import ModelRegistry
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+@@ -1827,10 +1826,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         """Load the NeuronModel."""
+         logger.info("Starting NeuronModel loading process")
+ 
+-        model_cls, _ = ModelRegistry.resolve_model_cls(
+-            self.vllm_config.model_config.architecture,
+-            model_config=self.vllm_config.model_config,
+-        )
++        from vllm_neuron.model.registry import resolve_model_cls
++
++        model_cls = resolve_model_cls(self.vllm_config.model_config)
+ 
+         # TODO: validate and ensure all vLLM configs are complied to
+ 
+diff --git a/vllm_neuron/vllm/worker/neuron_model_runner_v2.py b/vllm_neuron/vllm/worker/neuron_model_runner_v2.py
+index d0ce035..78683cc 100644
+--- a/vllm_neuron/vllm/worker/neuron_model_runner_v2.py
++++ b/vllm_neuron/vllm/worker/neuron_model_runner_v2.py
+@@ -592,8 +592,6 @@ class NeuronModelRunnerV2:
+         V1). A synthetic model short-circuits weight loading for off-device
+         execution.
+         """
+-        from vllm import ModelRegistry
+-
+         model_config = self.vllm_config.model_config
+         if model_config.runner_type != "generate":
+             raise ValueError(
+@@ -608,9 +606,9 @@ class NeuronModelRunnerV2:
+         self._submitted_forward_keepalive = None
+         self.capture_backend_model = None
+ 
+-        model_cls, _ = ModelRegistry.resolve_model_cls(
+-            model_config.architecture, model_config=model_config
+-        )
++        from vllm_neuron.model.registry import resolve_model_cls
++
++        model_cls = resolve_model_cls(model_config)
+ 
+         from vllm_neuron.model.synthetic import SyntheticNeuronModel
+ 
+-- 
+2.43.0
+
