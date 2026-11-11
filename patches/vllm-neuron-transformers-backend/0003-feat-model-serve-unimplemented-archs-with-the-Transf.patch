@@ -1,7 +1,7 @@
 From b9d881b51bec33238ccaed8134939c0899d1cd29 Mon Sep 17 00:00:00 2001
 From: Alvaro Moran <alvaro.moran@huggingface.co>
 Date: Wed, 11 Nov 2026 00:02:08 +0000
-Subject: [PATCH 3/4] feat(model): serve unimplemented archs with the
+Subject: [PATCH 3/5] feat(model): serve unimplemented archs with the
  Transformers backend
 
 vLLM resolves an architecture that vLLM Neuron has no implementation of

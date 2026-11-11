@@ -1,7 +1,7 @@
 From ad47ce7c1139340a4c373c80c202ffb2a0e6169e Mon Sep 17 00:00:00 2001
 From: Alvaro Moran <alvaro.moran@huggingface.co>
 Date: Wed, 11 Nov 2026 00:02:00 +0000
-Subject: [PATCH 2/4] feat(model): shard the Transformers backend from the HF
+Subject: [PATCH 2/5] feat(model): shard the Transformers backend from the HF
  tp_plan
 
 Follow the model's base_model_tp_plan: slice "colwise" linear layers on

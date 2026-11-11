@@ -1,7 +1,7 @@
 From 3a55186d9a7db34bcc9054410b70e6830493f52f Mon Sep 17 00:00:00 2001
 From: Alvaro Moran <alvaro.moran@huggingface.co>
 Date: Wed, 11 Nov 2026 00:03:02 +0000
-Subject: [PATCH 4/4] test(model): check the Transformers backend attention on
+Subject: [PATCH 4/5] test(model): check the Transformers backend attention on
  CPU
 
 Compare the paged-KV attention function with reference causal attention

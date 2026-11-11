@@ -1,7 +1,7 @@
 From 136707c5bf9637d046c40c66eb32d4445b013d98 Mon Sep 17 00:00:00 2001
 From: Alvaro Moran <alvaro.moran@huggingface.co>
 Date: Wed, 11 Nov 2026 00:01:51 +0000
-Subject: [PATCH 1/4] feat(model): add a Transformers modeling backend
+Subject: [PATCH 1/5] feat(model): add a Transformers modeling backend
 
 Serve a Hugging Face *ForCausalLM with the modeling code of transformers,
 as vLLM's Transformers modeling backend does on GPU (--model-impl
