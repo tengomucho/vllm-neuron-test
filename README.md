@@ -10,10 +10,11 @@ for that prototype, to match upstream vLLM's GPU experience
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
-- Prototype code: branch `transformers-backend` of `~/Dev/vllm-neuron`, 6
-  commits on top of `main` (`a080ebf`). The same commits are in
-  [`patches/vllm-neuron-transformers-backend/`](patches/vllm-neuron-transformers-backend/)
-  (`git am`-able).
+- Prototype code: branch `transformers-backend` of the fork
+  [`tengomucho/vllm-neuron`](https://github.com/tengomucho/vllm-neuron/tree/transformers-backend),
+  6 signed-off commits on top of upstream `main` (`fe7bf43`), checked out in
+  `~/Dev/vllm-neuron`
+  ([diff against upstream](https://github.com/vllm-project/vllm-neuron/compare/main...tengomucho:vllm-neuron:transformers-backend)).
 
 ## TL;DR
 
@@ -211,7 +212,7 @@ CPU unit tests (`VLLM_NEURON_CPU_MODE=1 pytest test/unit/model/`):
   ranks (threads, in-process all-reduce) and checks its logits against the
   unsharded model at TP 2, 4 and 8, with plain and replicated KV heads.
 
-Commits (in `patches/vllm-neuron-transformers-backend/`):
+Commits (branch `transformers-backend` of the fork):
 
 1. `feat(model): add a Transformers modeling backend` (TP=1)
 2. `feat(model): shard the Transformers backend from the HF tp_plan`
@@ -332,6 +333,6 @@ env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_
 - **Not covered**: multimodal (`TransformersMultiModalForCausalLM`), pooling,
   speculative decoding, quantization, LoRA, and prefix caching / chunked
   prefill on device (segmented prefill is only unit-tested on CPU).
-- **Upstreaming**: the partner asked for a working prototype on a fork first.
-  The commits are ready for a fork of `vllm-project/vllm-neuron`; none was
-  created yet, since that makes the code public.
+- **Upstreaming**: the partner asked for a working prototype on a fork first,
+  then a discussion of the PR and integration process. The fork is published;
+  no PR is open yet.
