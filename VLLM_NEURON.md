@@ -230,8 +230,13 @@ Commits (in `patches/vllm-neuron-transformers-backend/`):
    version, and glibc 2.39 exports the same functions as `GLIBC_2.2.5`.
    Workaround: [`scripts/patch_glibc_verneed.py`](scripts/patch_glibc_verneed.py)
    rewrites the version-needed entry; the original is kept as `_C.so.orig`.
-   libtorch-neuronx-lite, neuronx-cc and nki need at most glibc 2.34, so vLLM
-   Neuron itself is not affected.
+   The clean fix (untested here) is a container built from `ubuntu:26.04`,
+   which ships glibc 2.43. The Neuron apt repo has a `resolute` (26.04) suite
+   with the same runtime (`aws-neuronx-runtime-lib` 2.35.30), and the driver
+   runs on the host, so only the container changes. Installing 26.04's
+   `libc6` on 24.04 instead would mix releases (`libc-bin`, `locales`, the
+   gcc runtime) and is not recommended. libtorch-neuronx-lite, neuronx-cc and
+   nki need at most glibc 2.34, so vLLM Neuron itself is not affected.
 2. The Neuron pip repo serves an ancient `islpy`. With uv's default
    (first-index) strategy it hides the `islpy>=2026.1` that neuronx-cc 2.28
    needs, and the install fails. `--index-strategy unsafe-best-match` fixes
