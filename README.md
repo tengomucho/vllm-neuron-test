@@ -6,23 +6,24 @@ prototyping the **Transformers modeling backend** in it. AWS Annapurna asked
 for that prototype, to match upstream vLLM's GPU experience
 (`--model-impl transformers`).
 
-- Date: 2026-11-10/11.
+- Date: 2026-11-10 to 13.
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
-- Prototype code: branch `transformers-backend` of the fork
-  [`tengomucho/vllm-neuron`](https://github.com/tengomucho/vllm-neuron/tree/transformers-backend),
-  6 signed-off commits on top of upstream `main` (`fe7bf43`), checked out in
+- Prototype code: branch
+  [`transformers-backend`](https://github.com/tengomucho/vllm-neuron/tree/transformers-backend)
+  of the fork [`tengomucho/vllm-neuron`](https://github.com/tengomucho/vllm-neuron),
+  signed-off commits on top of upstream `main` (`fe7bf43`), checked out in
   `~/Dev/vllm-neuron`
   ([diff against upstream](https://github.com/vllm-project/vllm-neuron/compare/main...tengomucho:vllm-neuron:transformers-backend)).
 
 ## TL;DR
 
 - The transformers backend works on Trainium through vLLM Neuron, and the core
-  is small: ~400 lines in a new `vllm_neuron/model/transformers/` package, plus
-  a ~40-line registry hook. The runner, scheduler, KV-cache manager, bucketing
-  and compile path are untouched. Dynamo traces transformers' modeling code
-  as is.
+  is small: ~400 lines in a new `vllm_neuron/model/transformers/` package
+  (~740 with the LFM2 and MoE additions), plus a ~40-line registry hook. The
+  runner, scheduler, KV-cache manager, bucketing and compile path are
+  untouched. Dynamo traces transformers' modeling code as is.
 - Verified on device against HF transformers. Every token generated is HF
   fp32's argmax or within 0.08 logits of it, the same accuracy as vLLM
   Neuron's native implementations:
@@ -33,9 +34,21 @@ for that prototype, to match upstream vLLM's GPU experience
     automatically through the backend (Model Runner V2 for the dense models,
     V1 for the MoE);
   - `vllm serve` plus OpenAI chat completions.
+- **A 24B model up to 128k context**: LiquidAI/LFM2.5-24B-A2B, a hybrid of
+  short convolutions and attention with 64 experts, runs at TP 4 (13 GiB of
+  weights per rank) through the backend. It needed a paged state for the
+  convolutions, an experts function, expert sharding, and NKI segmented
+  attention for long prompts. See [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
+  - 4k context: TTFT 0.74 s for 3968 tokens, decode 38 ms/token (104
+    tokens/s with 4 sequences), GSM8K 93/100.
+  - 128k context: TTFT 66 s for 131k tokens, decode 47 ms/token, and
+    15/15 needles found at 32k, 64k and 128k.
+  - Its logprobs are as close to HF fp32 as HF's own bf16 run: 16 and 15
+    tokens of 128 off fp32's argmax.
 - Speed: decode is 10-30% slower than the native NKI implementation at
   TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
-  ops, so NKI attention kernels are the next step.
+  ops (but for segmented prefill), so NKI attention kernels are the next
+  step.
 - Found along the way, worth reporting to AWS:
   - the public torch-neuronx 2.33 wheels require glibc 2.43;
   - libtorch-neuronx-lite and vllm-neuron disagree on the default compile
@@ -138,6 +151,103 @@ contexts are untested.
 - The first `generate` after start-up pays a one-time 9-27 s with the
   precompile cache on, native models included.
 
+### 2.4 A 24B hybrid MoE: LFM2.5-24B-A2B
+
+[LiquidAI/LFM2.5-24B-A2B](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B)
+(`Lfm2MoeForCausalLM`) has 40 layers: 30 gated short convolutions and 10 GQA
+attention layers (32 query heads, 8 KV heads). After 2 dense layers, the
+feed-forwards are 64-expert MoEs (top-4, sigmoid routing with an fp32 expert
+bias). That is 24B parameters, about 2B active per token, and 128k context.
+vLLM Neuron has no implementation of it, so the backend serves it, on Model
+Runner V1 (hybrid and MoE models).
+
+It needed a paged state for the short convolutions, a Neuron experts
+function, and expert sharding (see [Design](#3-design)). At TP 4, a rank holds
+13.08 GiB of weights out of 24 GiB of HBM. Only the experts are sharded: the
+HF plan of this model shards nothing else.
+
+All runs: bf16, TP 4, greedy, one 4096-token prefill bucket, prefix caching
+off ([`scripts/bench_offline.py`](scripts/bench_offline.py)).
+
+**4k context** (max_model_len 4096, 4 sequences), measured with the first
+LFM2 version, which kept one conv entry per token:
+
+| | |
+|---|---|
+| start-up, cold (compiles 1 prefill and 1 decode graph) | 335 s |
+| start-up, warm (compiled graphs cached) | 95 s, about 49 s of it loading weights |
+| TTFT, 3968-token prompt | 0.735 s |
+| decode, 1 sequence | 38.0 ms/token |
+| decode, 4 sequences | 38.6 ms/step, 104 tokens/s |
+| KV cache | 49,600 tokens |
+
+Each rank loads the whole 48 GB checkpoint, then keeps its shard: hence the
+time spent loading weights.
+
+**128k context** (max_model_len 131072, 1 sequence, decode graphs for 32k, 64k
+and 128k of context through `decode_context_length_buckets`):
+
+| prompt tokens | TTFT | prefill | decode |
+|---|---|---|---|
+| 32,512 | 10.5 s | 3.1k tokens/s | 35.6 ms/token |
+| 65,280 | 24.9 s | 2.6k tokens/s | 40.5 ms/token |
+| 130,816 | 65.9 s | 2.0k tokens/s | 47.3 ms/token |
+
+With max_model_len 8192 (and logprobs on), a 7936-token prompt (2 chunks)
+takes 2.3 s.
+
+- Start-up: 136 s warm, 924 s cold (compiling the 4 graphs takes 842 s).
+- The KV cache holds 198,432 tokens, 1.5 sequences of 128k. A token takes
+  28 KB: 20 KB of attention K/V and 7.5 KB of conv state. With one conv entry
+  per token (the first LFM2 version), it took 143 KB, which left room for
+  about 49k tokens.
+- Prompts longer than 4096 tokens are prefilled in 4096-token chunks. Each
+  chunk attends over all the chunks before it, so TTFT grows faster than the
+  prompt.
+- Decode gathers the whole context of each attention layer with PyTorch ops,
+  so a decode step slows down with the context. The context buckets keep a
+  32k sequence from paying for 128k.
+- TP 4 is enough for 128k: no need to split further.
+
+**Accuracy:**
+
+- [`scripts/bf16_baseline.py`](scripts/bf16_baseline.py) re-scores vLLM's
+  greedy tokens under teacher forcing with HF fp32 and HF bf16 (32 tokens per
+  prompt). This model is sensitive to bf16 (sigmoid routing with an fp32
+  expert bias), so the bar is HF's own bf16 run, not fp32. With the final
+  code and max_model_len 8192, prompts go through the NKI segmented attention,
+  and the 7936-token prompt takes 2 chunks:
+
+  | prompt | vLLM: tokens not fp32's argmax | vLLM: mean \|logprob − fp32\| | HF bf16: argmax ≠ fp32's | HF bf16: mean \|logprob − fp32\| |
+  |---|---|---|---|---|
+  | "The capital of France is" | 6/32 | 0.133 | 6/32 | 0.158 |
+  | "The future of AI is" | 2/32 | 0.123 | 1/32 | 0.147 |
+  | "def fibonacci(n):" | 8/32 | 0.191 | 8/32 | 0.161 |
+  | 7936-token prompt | 0/32 | 0.015 | 0/32 | 0.007 |
+  | **all** | **16/128** | **0.115** | **15/128** | **0.118** |
+
+  The first LFM2 version, at 4k (3968-token prompt, one chunk), scored the
+  same way: 18/128 and 0.23 for vLLM, 17/128 and 0.25 for HF bf16.
+- [`scripts/gsm8k_eval.py`](scripts/gsm8k_eval.py), first 100 GSM8K test
+  questions, greedy chat, up to 3584 tokens (first LFM2 version, 4k):
+  **93/100**. The 7 misses all hit the token limit while still reasoning. It
+  took 14.7 min for 82.6k tokens (93 tokens/s, 4 sequences at a time).
+- [`scripts/needle_eval.py`](scripts/needle_eval.py), needle in a haystack: a
+  7-digit passcode hidden in installed packages' READMEs (dist-info
+  METADATA), at depths 10%, 30%, 50%, 70% and 90%, then asked for:
+
+  | context | prompt tokens | passcode in the final answer |
+  |---|---|---|
+  | 32k | 30,636 | 5/5 |
+  | 64k | 63,404 | 5/5 |
+  | 128k | 128,939 | 5/5 |
+
+  The model reasons for 200 to 1,600 tokens before it answers, so it gets
+  2048. With 512, 8 of 15 answers were cut while the model was still
+  reasoning, 7 of them after it had quoted the passcode.
+- The 130,816-token prompt (README.md repeated) is continued exactly: the 32
+  greedy tokens are the README text that follows it.
+
 ## 3. Design
 
 On GPU, vLLM's Transformers backend builds the HF model with
@@ -160,12 +270,18 @@ prototype implements that contract around an HF model.
   - **prefill** (one sequence, no prior cache): causal attention over the
     step's own tokens. The runner pads after the real tokens, so no real
     token sees the padding;
-  - **decode and segmented prefill**: each sequence gathers its blocks
-    through its block table (unused entries are `-1`) and masks keys by
-    position.
+  - **segmented prefill** (a prompt longer than `max_num_batched_tokens`,
+    prefilled in chunks): vLLM Neuron's `NF.segmented_attention`, an NKI
+    kernel, reads the cache in segments of `kv_segment_size` tokens. Gathering
+    the whole context instead would take 17 GB of fp32 scores per layer for a
+    4096-token chunk at 32k;
+  - **decode**: each sequence gathers its blocks through its block table
+    (unused entries are `-1`) and masks keys by position. Each KV head
+    attends for its group of query heads, without repeating K/V.
 
   It also handles sliding window, soft-cap and attention sinks, which
-  transformers passes as kwargs. Plain PyTorch, no NKI.
+  transformers passes as kwargs. Plain PyTorch, except segmented prefill
+  (soft-capped attention keeps the PyTorch path there too).
 - **`TransformersForCausalLM`**:
   - builds the model with `AutoModelForCausalLM.from_config` on `meta`, and
     loads it with `from_pretrained` in `load_weights`, so transformers applies
@@ -185,13 +301,33 @@ prototype implements that contract around an HF model.
   - with fewer KV heads than ranks, KV heads are replicated, as vLLM does:
     each rank keeps the KV head of its query heads;
   - embeddings and the LM head stay replicated.
-- **Mixture of experts**: MoE configs request transformers'
-  `experts_implementation="batched_mm"`, which gathers each token's expert
-  weights and runs a batched matmul. Its shapes do not depend on the routing,
+- **Mixture of experts**: MoE configs request
+  `experts_implementation="neuron"`, `neuron_experts_forward` registered in
+  transformers' `ExpertsInterface`. Its shapes do not depend on the routing,
   so it compiles into a static graph, unlike the default `grouped_mm` and its
-  `eager` fallback. Memory grows with tokens × top-k × expert size, so this
-  only suits small models; a Neuron experts function (`ExpertsInterface`)
-  using vLLM Neuron's MoE kernels is the scalable path.
+  `eager` fallback:
+  - for a few tokens (2 × tokens × top-k ≤ experts, as in decode), it runs
+    transformers' `batched_mm`, which gathers each (token, expert) pair's
+    weights;
+  - past that, the gathered copies outgrow the experts (a 4096-token prefill
+    of LFM2.5-24B-A2B would gather 77 GB per layer at TP 4). Every token then
+    goes through every expert, as two dense matmuls, scaled by its routing
+    weights (zero for the experts it is not routed to).
+
+  No NKI MoE kernel yet.
+- **Expert sharding**, from the HF plan: `packed_colwise` slices both halves
+  of the fused gate/up weights, `rowwise` slices the input dimension of the
+  down projections, and `moe_tp_experts` all-reduces the experts' output.
+- **LFM2 short convolutions**: `_PagedShortConv` replaces each gated short
+  convolution (`in_proj` → B, C, x; `out_proj(C · conv(B · x))`, kernel 3).
+  Its state, the last 2 inputs B · x of a sequence, lives in a key-only paged
+  cache that vLLM allocates and manages like K/V: one more `LayerSpec` per
+  conv layer, the same block table. Each block keeps 2 entries, position p at
+  entry p mod 2 of its block, 1/16 of a per-token cache with 32-token blocks.
+  A step takes the window of its own tokens from the step, reads the earlier
+  positions from the cache, then writes the last 2 tokens of each sequence.
+  Prefill, chunked prefill and batched decode share this one path, and
+  vLLM's per-sequence (Mamba-style) state is not needed.
 
 `vllm_neuron/model/registry.py`:
 
@@ -211,15 +347,14 @@ CPU unit tests (`VLLM_NEURON_CPU_MODE=1 pytest test/unit/model/`):
 - `test_transformers_backend_tp.py` shards a tiny random Llama over simulated
   ranks (threads, in-process all-reduce) and checks its logits against the
   unsharded model at TP 2, 4 and 8, with plain and replicated KV heads.
+- `test_transformers_backend_hybrid.py` runs a tiny random LFM2-MoE through
+  the backend (prefill with null-block and `-1` padding, batched decode,
+  chunked prefill then decode) and checks its logits against transformers. It
+  also checks both experts paths against `eager`, and the sharded experts at
+  TP 2 and 4.
 
-Commits (branch `transformers-backend` of the fork):
-
-1. `feat(model): add a Transformers modeling backend` (TP=1)
-2. `feat(model): shard the Transformers backend from the HF tp_plan`
-3. `feat(model): serve unimplemented archs with the Transformers backend`
-4. `test(model): check the Transformers backend attention on CPU`
-5. `feat(model): replicate KV heads when TP exceeds them`
-6. `feat(model): run MoE models with batched_mm experts`
+The commits are on the
+[`transformers-backend` branch of the fork](https://github.com/tengomucho/vllm-neuron/commits/transformers-backend).
 
 ## 4. Issues found
 
@@ -283,6 +418,19 @@ Commits (branch `transformers-backend` of the fork):
     must follow the on-device sampling return convention (tokens, gathered
     logits). The Transformers backend reuses vLLM Neuron's `Sampler` for that.
     Disabling ODS was not tested.
+11. vLLM replaces the checkpoint's config with its own `Lfm2MoeConfig`
+    (`vllm/transformers_utils/configs`), which has no `base_model_tp_plan`.
+    The backend falls back to the plan of the transformers model's config
+    class.
+12. **Model Runner V1 returns no logprobs with async scheduling**, the
+    default: requests that ask for logprobs get empty lists. Pass
+    `async_scheduling=False`, and set `max_logprobs` in `neuron_config` so that
+    the model returns logits. `logprobs=0` returns nothing either: ask for 1.
+13. Padding slots differ by side: Model Runner V1 pads `slot_mapping` (writes)
+    with the null block, slot 0, and block tables (reads) with -1. The
+    `paged_slot_indices` docstring only mentions -1 for writes. The LFM2 conv
+    state first took null-block slots for real tokens, which only short
+    prompts showed: their decoding degenerated after the first token.
 
 ## 5. Reproduce
 
@@ -300,7 +448,18 @@ python hf_cpu_reference.py --model unsloth/gemma-3-270m-it --out /tmp/ref.json &
 echo "qwen3 Qwen/Qwen3-0.6B transformers 4" | bash run_matrix.sh /tmp
 # Online serving:
 bash serve_check.sh /tmp/serve.log Qwen/Qwen3-0.6B --model-impl transformers
-# Unit tests (CPU: attention, TP sharding), from ~/Dev/vllm-neuron:
+# LFM2.5-24B-A2B at TP 4: speed at 4k, then at 32k/64k/128k context:
+python bench_offline.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --out /tmp/lfm.json
+python bench_offline.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --max-model-len 131072 --max-num-seqs 1 \
+  --prompt-tokens 32512 65280 130816 --decode-context-buckets 32768 65536
+# Accuracy: logprobs against HF fp32 and HF bf16, GSM8K, needles up to 128k:
+python bench_offline.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --logprobs --out /tmp/lfm_lp.json
+python bf16_baseline.py --model LiquidAI/LFM2.5-24B-A2B /tmp/lfm_lp.json
+curl -o /tmp/gsm8k.json "https://datasets-server.huggingface.co/rows?dataset=openai/gsm8k&config=main&split=test&offset=0&length=100"
+python gsm8k_eval.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 /tmp/gsm8k.json
+python needle_eval.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --max-model-len 131072 \
+  --context-tokens 32768 65536 131072 --decode-context-buckets 32768 65536
+# Unit tests (CPU: attention, TP sharding, LFM2 hybrid), from ~/Dev/vllm-neuron:
 VLLM_NEURON_CPU_MODE=1 python -m pytest -q test/unit/model/
 # Plain transformers on torch-neuronx (leave TORCH_DEVICE_BACKEND_AUTOLOAD unset):
 env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_transformers.py
@@ -309,30 +468,35 @@ env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_
 ## 6. Gaps and next steps
 
 - **Performance**: decode gathers each sequence's whole block table and
-  computes attention with plain ops. vLLM Neuron's existing
-  `decode_context_length_buckets` option trims the block table to the decode
-  bucket, so the gather then reads only that bucket's blocks, not
-  max_model_len (untested with this backend). Next:
-  - NKI attention kernels: `flash_attention` for prefill, and a paged decode
-    kernel that takes Q/K/V (the current `attention_decode` fuses the QKV and
-    output projections, so it doesn't fit the attention interface);
+  computes attention with plain ops. vLLM Neuron's
+  `decode_context_length_buckets` trims the block table to the decode bucket,
+  so the gather reads only that bucket's blocks (used for the 128k runs).
+  Next:
+  - NKI attention kernels: `flash_attention` for single-step prefill, and a
+    paged decode kernel that takes Q/K/V (the current `attention_decode` fuses
+    the QKV and output projections, so it doesn't fit the attention
+    interface). Segmented prefill already uses the NKI kernel;
+  - NKI MoE kernels (`moe_cte`/`moe_tkg`) behind the experts function. LFM2.5
+    decode at 38 ms/token is far from what its 2B active parameters need;
   - fused QKV and gate/up projections, and a vocab-sharded LM head
-    (`ColumnParallelLinear`), as upstream's fusers do.
+    (`ColumnParallelLinear`), as upstream's fusers do;
+  - load only each rank's shard: every rank reads the whole checkpoint (49 s
+    of the 95 s warm start-up of LFM2.5-24B-A2B).
 - **TP**: the number of attention heads must be divisible by the TP size, and
-  KV heads and TP size must divide one another. Still missing:
-  `packed_colwise` (fused gate_up/qkv, e.g. Phi3), `colwise_gather_output`,
-  the MoE/EP styles, and sequence parallelism.
+  KV heads and TP size must divide one another. The backend follows the HF
+  plan, so models whose plan shards only the experts (LFM2-MoE) replicate
+  their attention, convolutions and caches on every rank. Still missing:
+  `packed_colwise` on linear layers (fused gate_up/qkv, e.g. Phi3),
+  `colwise_gather_output`, expert parallelism (`ep_*`), and sequence
+  parallelism.
 - **Sliding window**: a full-length cache is allocated and the window is
   applied by masking. Declaring `sliding_window_size` in the KV spec would
   save memory.
-- **MoE**: works with `batched_mm` on a tiny model only. For real MoE sizes,
-  register a Neuron experts function in transformers' `ExpertsInterface`,
-  the counterpart of the attention one, backed by vLLM Neuron's MoE kernels
-  (`moe_cte`/`moe_tkg`). Also missing: expert parallelism, and TP of the
-  experts (the `moe_tp_experts`/`ep_*` plan styles).
+- **Hybrids**: the short-conv state follows LFM2 (`in_proj`, `conv`,
+  `out_proj`). Other state-space layers (Mamba, linear attention) would need
+  their own paged state.
 - **Not covered**: multimodal (`TransformersMultiModalForCausalLM`), pooling,
-  speculative decoding, quantization, LoRA, and prefix caching / chunked
-  prefill on device (segmented prefill is only unit-tested on CPU).
+  speculative decoding, quantization, LoRA, and prefix caching on device.
 - **Upstreaming**: the partner asked for a working prototype on a fork first,
   then a discussion of the PR and integration process. The fork is published;
   no PR is open yet.
