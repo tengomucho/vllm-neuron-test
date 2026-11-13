@@ -97,8 +97,8 @@ exactly. The other diverges at token 8 on a near-tie (HF fp32 logits: "The"
 
 ### 2.3 vLLM Neuron, Transformers backend
 
-All runs use greedy decoding on 2 prompts, 16 tokens, max_model_len 128, and
-are compared with HF transformers on CPU (bf16 greedy, plus an fp32
+All runs but the last use greedy decoding on 2 prompts, 16 tokens,
+max_model_len 128, and are compared with HF transformers on CPU (bf16 greedy, plus an fp32
 teacher-forced re-scoring):
 
 | model | arch in vllm-neuron? | selected by | TP | vs HF CPU greedy | max fp32 logit gap |
@@ -114,6 +114,7 @@ teacher-forced re-scoring):
 | Llama-3.2-1B-Instruct (tied emb.) | yes (Llama) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 7 | 0.054 |
 | TinyLlama-1.1B (4 KV heads, replicated) | yes (Llama) | `--model-impl transformers` | 8 | 1 exact, 1 near-tie at token 8 | 0.039 |
 | tiny-random Qwen3-MoE (8 experts, top-2) | **no** | default (auto fallback), Model Runner V1 | 1 | 1 exact, 1 near-tie at token 9 (vs fp32) | 0.055 |
+| LFM2.5-24B-A2B (hybrid conv/attention, 64 experts) | **no** | default (auto fallback), Model Runner V1 | 4 | 16/128 tokens off fp32's argmax (HF bf16: 15/128) | 1.691 (HF bf16: 1.691) |
 
 "Max fp32 logit gap" comes from
 [`scripts/teacher_forced_logprobs.py`](scripts/teacher_forced_logprobs.py),
@@ -122,6 +123,12 @@ The gap is how far each generated token is below HF's argmax, maximised over
 all tokens. Greedy string matching is a weak test on these small models,
 which hit near-ties within a few tokens, so this is the number to look at.
 The native TinyLlama run scores 0.039 by the same measure.
+
+The LFM2.5-24B-A2B row comes from [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b):
+4 prompts (one of 7936 tokens), 32 tokens each, max_model_len 8192,
+re-scored by [`scripts/bf16_baseline.py`](scripts/bf16_baseline.py). This
+model is sensitive to bf16, so it is compared with HF's own bf16 run rather
+than with a CPU greedy reference, and its gap is the same as HF bf16's.
 
 **Online serving:** `vllm serve Qwen/Qwen3-0.6B --model-impl transformers`
 ([`scripts/serve_check.sh`](scripts/serve_check.sh)). An OpenAI
