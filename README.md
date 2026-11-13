@@ -45,6 +45,9 @@ for that prototype, to match upstream vLLM's GPU experience
     15/15 needles found at 32k, 64k and 128k.
   - Its logprobs are as close to HF fp32 as HF's own bf16 run: 16 and 15
     tokens of 128 off fp32's argmax.
+- **A Docker image** on Ubuntu 26.04, [`docker/Dockerfile`](docker/Dockerfile),
+  needs none of this host's workarounds. Its entrypoint is `vllm`, and it
+  serves Qwen3-0.6B and LFM2.5-24B-A2B. See [Docker image](#docker-image).
 - Speed: decode is 10-30% slower than the native NKI implementation at
   TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
   ops (but for segmented prefill), so NKI attention kernels are the next
@@ -53,9 +56,12 @@ for that prototype, to match upstream vLLM's GPU experience
   - the public torch-neuronx 2.33 wheels require glibc 2.43;
   - libtorch-neuronx-lite and vllm-neuron disagree on the default compile
     route;
-  - a PyTorch precompile-cache bug.
+  - a PyTorch precompile-cache bug;
+  - neuronx-cc needs `libarchive.so.13`, which no package declares;
+  - the compile cache spans three directories that point to one another:
+    keeping only some of them makes start-up fail instead of recompiling.
 
-  See [Issues found](#issues-found).
+  See [Issues found](#4-issues-found).
 
 ## 1. Environment
 
@@ -78,6 +84,64 @@ python scripts/patch_glibc_verneed.py .venv/lib/python3.14/site-packages/torch_n
 source scripts/env.sh                         # issues 4, 5, 7
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0        # for vLLM processes only (issue 6)
 ```
+
+### Docker image
+
+[`docker/Dockerfile`](docker/Dockerfile) builds the same stack on Ubuntu 26.04.
+Its glibc 2.43 loads the torch-neuronx wheels as they are, and its system
+Python keeps `libpython3.14.so` on the loader path, so neither the glibc patch
+(issue 1) nor `scripts/env.sh` is needed. The image holds:
+
+- the Neuron runtime, collectives and tools (`neuron-ls`, `neuron-top`), from
+  the `resolute` suite of the Neuron apt repo, at this host's versions. The
+  driver stays on the host;
+- the system Python 3.14 and a uv venv in `/opt/venv`, with the packages of
+  the table above. vllm-neuron comes from the fork's `transformers-backend`
+  branch;
+- `libpython3.14` and `libarchive13t64`, which torch_xla and neuronx-cc link
+  but no package pulls in (issue 14);
+- `VLLM_NEURON_BACKEND=neuron_native`, `TORCH_DEVICE_BACKEND_AUTOLOAD=0` and
+  `NEURON_SKIP_EFA_AFFINITY=1` (issues 5 to 7), and
+  `NKI_COMPILE_CACHE_URL=/root/.cache/nki` (issue 15);
+- `vllm` as its entrypoint.
+
+It takes 12.2 GB, most of it the CUDA libraries that vLLM's torch pulls in.
+
+```bash
+docker build -t vllm-neuron-transformers docker/
+docker run --rm -p 8000:8000 --shm-size=16g \
+  $(for d in /dev/neuron*; do echo --device=$d; done) \
+  -v neuron-cache:/root/.cache -e HF_TOKEN \
+  vllm-neuron-transformers serve Qwen/Qwen3-0.6B --model-impl transformers \
+  --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
+  --max-num-batched-tokens 256 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [256], "num_seqs_buckets": [2]}}'
+# LFM2.5-24B-A2B at 4k context, 4 sequences (the setup of 2.4), same docker flags:
+docker run ... vllm-neuron-transformers serve LiquidAI/LFM2.5-24B-A2B \
+  --tensor-parallel-size 4 --max-model-len 4096 --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 --no-enable-prefix-caching \
+  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [4096], "num_seqs_buckets": [4]}}'
+```
+
+- **Cache volume**: keep all of `/root/.cache` in one volume. It holds the
+  models (`huggingface/`) and the whole compile cache: the compiled graphs
+  (`vllm/neuron/`), their NEFFs (`neuron_libtorch/`) and the NKI kernels
+  (`nki/`). Keeping only some of them makes start-up fail instead of
+  recompiling (issue 15).
+- **Fork version**: the branch is fetched when the image is built, and Docker
+  reuses that layer afterwards. To pick up a newer commit, rebuild with
+  `--no-cache`, or pass one with `--build-arg VLLM_NEURON_REF=<commit>`.
+
+Tested on this host, whose Docker daemon sees neither the host's files nor its
+network: the models went to a named volume, and the requests were sent from
+inside the container with `docker exec ... curl` (`-p` is untested). Each run
+sent one chat completion ("What is the capital of France?"). Start-up times
+leave out downloading the model, which was already in the volume:
+
+| model | TP | cold start | warm start | answer |
+|---|---|---|---|---|
+| Qwen3-0.6B (`--model-impl transformers`) | 4 | 184 s | 70 s | reasons its way to Paris (cut at 64 tokens) |
+| LFM2.5-24B-A2B (4k context, 4 sequences) | 4 | 509 s | 121 s | "The capital of France is Paris.", after 50 tokens of reasoning |
 
 ## 2. Results
 
@@ -373,13 +437,15 @@ The commits are on the
    version, and glibc 2.39 exports the same functions as `GLIBC_2.2.5`.
    Workaround: [`scripts/patch_glibc_verneed.py`](scripts/patch_glibc_verneed.py)
    rewrites the version-needed entry; the original is kept as `_C.so.orig`.
-   The clean fix (untested here) is a container built from `ubuntu:26.04`,
-   which ships glibc 2.43. The Neuron apt repo has a `resolute` (26.04) suite
-   with the same runtime (`aws-neuronx-runtime-lib` 2.35.30), and the driver
-   runs on the host, so only the container changes. Installing 26.04's
-   `libc6` on 24.04 instead would mix releases (`libc-bin`, `locales`, the
-   gcc runtime) and is not recommended. libtorch-neuronx-lite, neuronx-cc and
-   nki need at most glibc 2.34, so vLLM Neuron itself is not affected.
+   The clean fix is a container built from `ubuntu:26.04`, which ships glibc
+   2.43: [`docker/Dockerfile`](docker/Dockerfile), tested here (see
+   [Docker image](#docker-image)). The Neuron apt repo has a `resolute`
+   (26.04) suite with the same runtime (`aws-neuronx-runtime-lib` 2.35.30),
+   and the driver runs on the host, so only the container changes.
+   Installing 26.04's `libc6` on 24.04 instead would mix releases
+   (`libc-bin`, `locales`, the gcc runtime) and is not recommended.
+   libtorch-neuronx-lite, neuronx-cc and nki need at most glibc 2.34, so vLLM
+   Neuron itself is not affected.
 2. The Neuron pip repo serves an ancient `islpy`. With uv's default
    (first-index) strategy it hides the `islpy>=2026.1` that neuronx-cc 2.28
    needs, and the install fails. `--index-strategy unsafe-best-match` fixes
@@ -438,6 +504,36 @@ The commits are on the
     `paged_slot_indices` docstring only mentions -1 for writes. The LFM2 conv
     state first took null-block slots for real tokens, which only short
     prompts showed: their decoding degenerated after the first token.
+14. Two system libraries are needed but not declared. On a bare Ubuntu 26.04
+    they are missing:
+    - neuronx-cc's `walrus_driver` links `libarchive.so.13`. Without it, the
+      first compilation fails with `error while loading shared libraries:
+      libarchive.so.13: cannot open shared object file`;
+    - torch_xla's `_XLAC` links `libpython3.14.so.1.0` (see issue 4).
+
+    The Dockerfile installs `libarchive13t64` and `libpython3.14`.
+15. **The compile cache is spread over three directories** that point to one
+    another:
+    - vLLM Neuron keeps the compiled graphs under `VLLM_CACHE_ROOT`
+      (`~/.cache/vllm/neuron/`);
+    - libtorch-neuronx-lite keeps their NEFFs, and an index of the NKI kernels
+      it compiled, in `~/.cache/neuron_libtorch/`;
+    - nki keeps the kernel binaries in `/var/tmp/nki-intermediate-cache`
+      (`NKI_COMPILE_CACHE_URL`).
+
+    Keeping only some of them makes start-up fail instead of recompiling. Both
+    failures showed up in containers:
+    - with the graphs but not the NEFFs (only `~/.cache/vllm` kept), a warm
+      start fails on every rank with `NEFF for cache_key=... is neither on
+      disk at ... nor resident in the compilation cache`;
+    - with the kernel index but not the binaries (`~/.cache` kept, not
+      `/var/tmp`), the next model that uses the same kernel (here the
+      sampler's `cumsum`) fails to compile with `[NCC_EVRF059] Kernel file
+      '/var/tmp/nki-intermediate-cache/...colz' ... does not exist on the
+      host`.
+
+    The Dockerfile moves the NKI cache to `~/.cache/nki`, so that one volume
+    on `~/.cache` keeps all three.
 
 ## 5. Reproduce
 
@@ -470,6 +566,8 @@ python needle_eval.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --max-model-len 131
 VLLM_NEURON_CPU_MODE=1 python -m pytest -q test/unit/model/
 # Plain transformers on torch-neuronx (leave TORCH_DEVICE_BACKEND_AUTOLOAD unset):
 env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_transformers.py
+# Docker image, from ~/Dev/vllm-test (`docker run` commands in 1, Docker image):
+docker build -t vllm-neuron-transformers docker/
 ```
 
 ## 6. Gaps and next steps
