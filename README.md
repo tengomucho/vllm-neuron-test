@@ -101,9 +101,11 @@ Python keeps `libpython3.14.so` on the loader path, so neither the glibc patch
 - `libpython3.14` and `libarchive13t64`, which torch_xla and neuronx-cc link
   but no package pulls in (issue 14);
 - `VLLM_NEURON_BACKEND=neuron_native`, `TORCH_DEVICE_BACKEND_AUTOLOAD=0` and
-  `NEURON_SKIP_EFA_AFFINITY=1` (issues 5 to 7), and
-  `NKI_COMPILE_CACHE_URL=/root/.cache/nki` (issue 15);
-- `vllm` as its entrypoint.
+  `NEURON_SKIP_EFA_AFFINITY=1` (issues 5 to 7);
+- the whole compile cache under `/root/.cache/neuron-compile` (see
+  [Compile cache](#compile-cache));
+- an entrypoint that runs `vllm`, after pulling the compile cache from an HF
+  bucket if `NEURON_COMPILE_CACHE_BUCKET` is set.
 
 It takes 12.2 GB, most of it the CUDA libraries that vLLM's torch pulls in.
 
@@ -111,7 +113,8 @@ It takes 12.2 GB, most of it the CUDA libraries that vLLM's torch pulls in.
 docker build -t vllm-neuron-transformers docker/
 docker run --rm -p 8000:8000 --shm-size=16g \
   $(for d in /dev/neuron*; do echo --device=$d; done) \
-  -v neuron-cache:/root/.cache -e HF_TOKEN \
+  -v neuron-cache:/root/.cache -v neuron-compile-cache:/root/.cache/neuron-compile \
+  -e HF_TOKEN -e NEURON_COMPILE_CACHE_BUCKET \
   vllm-neuron-transformers serve Qwen/Qwen3-0.6B --model-impl transformers \
   --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
   --max-num-batched-tokens 256 --no-enable-prefix-caching \
@@ -123,14 +126,47 @@ docker run ... vllm-neuron-transformers serve LiquidAI/LFM2.5-24B-A2B \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [4096], "num_seqs_buckets": [4]}}'
 ```
 
-- **Cache volume**: keep all of `/root/.cache` in one volume. It holds the
-  models (`huggingface/`) and the whole compile cache: the compiled graphs
-  (`vllm/neuron/`), their NEFFs (`neuron_libtorch/`) and the NKI kernels
-  (`nki/`). Keeping only some of them makes start-up fail instead of
-  recompiling (issue 15).
-- **Fork version**: the branch is fetched when the image is built, and Docker
-  reuses that layer afterwards. To pick up a newer commit, rebuild with
-  `--no-cache`, or pass one with `--build-arg VLLM_NEURON_REF=<commit>`.
+The branch of the fork is fetched when the image is built, and Docker reuses
+that layer afterwards. To pick up a newer commit, rebuild with `--no-cache`,
+or pass one with `--build-arg VLLM_NEURON_REF=<commit>`.
+
+#### Compile cache
+
+The image keeps the three directories of the compile cache under
+`/root/.cache/neuron-compile`, which its environment sets:
+
+| directory | holds | set by |
+|---|---|---|
+| `vllm/` | vLLM Neuron's compiled graphs | `VLLM_CACHE_ROOT` |
+| `neuron_libtorch/` | their NEFFs, and an index of the NKI kernels | `NEURON_LIBTORCH_CACHE_ROOT` |
+| `nki/` | the NKI kernel binaries | `NKI_COMPILE_CACHE_URL` |
+
+They point to one another, by absolute path for the NKI kernels: keeping only
+some of them makes start-up fail instead of recompiling (issue 15). Mount the
+whole directory, on a volume or a host directory, apart from the models.
+Entries are keyed by the model's vLLM config, the buckets, the compiler options
+and the versions of the stack. So one cache holds several models and
+configurations, and an image with other versions misses rather than loading
+stale graphs.
+
+Like the NEFF cache of the
+[aws-neuron model support sweep](https://huggingface.co/spaces/aws-neuron/torch-neuronx-model-support),
+the cache can live in an HF bucket. With `NEURON_COMPILE_CACHE_BUCKET` set,
+the entrypoint first runs
+`hf buckets sync $NEURON_COMPILE_CACHE_BUCKET /root/.cache/neuron-compile`. If
+the pull fails, it warns and vLLM compiles what it needs. The public bucket
+[`tengomucho/vllm-neuron-compile-cache`](https://huggingface.co/buckets/tengomucho/vllm-neuron-compile-cache)
+holds the graphs of the two commands above, and of LFM2.5-24B-A2B at 128k
+context, compiled on trn2. To push what a run compiled (with an `HF_TOKEN`
+that can write to the bucket):
+
+```bash
+docker run --rm -e HF_TOKEN -v neuron-compile-cache:/root/.cache/neuron-compile \
+  --entrypoint hf vllm-neuron-transformers \
+  buckets sync /root/.cache/neuron-compile hf://buckets/tengomucho/vllm-neuron-compile-cache
+```
+
+#### Tests on this host
 
 Tested on this host, whose Docker daemon sees neither the host's files nor its
 network: the models went to a named volume, and the requests were sent from
@@ -532,8 +568,8 @@ The commits are on the
       '/var/tmp/nki-intermediate-cache/...colz' ... does not exist on the
       host`.
 
-    The Dockerfile moves the NKI cache to `~/.cache/nki`, so that one volume
-    on `~/.cache` keeps all three.
+    The Dockerfile puts all three under `/root/.cache/neuron-compile`, so that
+    one volume, or one bucket sync, keeps them together.
 
 ## 5. Reproduce
 

@@ -5,7 +5,8 @@
 #   docker build -t vllm-neuron-transformers docker/
 #   docker run --rm -p 8000:8000 --shm-size=16g \
 #     $(for d in /dev/neuron*; do echo --device=$d; done) \
-#     -v neuron-cache:/root/.cache -e HF_TOKEN \
+#     -v neuron-cache:/root/.cache -v neuron-compile-cache:/root/.cache/neuron-compile \
+#     -e HF_TOKEN -e NEURON_COMPILE_CACHE_BUCKET \
 #     vllm-neuron-transformers serve <model> ...
 FROM ubuntu:26.04
 
@@ -64,14 +65,22 @@ RUN echo "transformers==5.22.2" > /tmp/overrides.txt \
 # - TORCH_DEVICE_BACKEND_AUTOLOAD=0: keeps torch-neuronx from loading in vLLM
 #   (issue 6); unset it to run plain torch-neuronx scripts;
 # - NEURON_SKIP_EFA_AFFINITY=1: without EFA devices in the container, workers
-#   fail on the EFA CPU-affinity setup (issue 5); set it to 0 when passing them;
-# - NKI_COMPILE_CACHE_URL: keeps the NKI kernel binaries (/var/tmp by default)
-#   in ~/.cache with the rest of the compile cache, which points to them
-#   (issue 15). Mount a volume on /root/.cache to keep them all.
+#   fail on the EFA CPU-affinity setup (issue 5); set it to 0 when passing them.
 ENV VLLM_NEURON_BACKEND=neuron_native \
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-    NEURON_SKIP_EFA_AFFINITY=1 \
-    NKI_COMPILE_CACHE_URL=/root/.cache/nki
+    NEURON_SKIP_EFA_AFFINITY=1
 
-ENTRYPOINT ["vllm"]
+# The compile cache spans three directories that point to one another (issue
+# 15): vLLM Neuron's compiled graphs, their NEFFs, and the NKI kernel binaries
+# (/var/tmp by default). They all go under NEURON_COMPILE_CACHE, so that one
+# volume or one bucket sync keeps them together. Mount it apart from the models
+# (/root/.cache/huggingface).
+ENV NEURON_COMPILE_CACHE=/root/.cache/neuron-compile
+ENV VLLM_CACHE_ROOT=$NEURON_COMPILE_CACHE/vllm \
+    NEURON_LIBTORCH_CACHE_ROOT=$NEURON_COMPILE_CACHE/neuron_libtorch \
+    NKI_COMPILE_CACHE_URL=$NEURON_COMPILE_CACHE/nki
+
+# `vllm`, after pulling the compile cache from NEURON_COMPILE_CACHE_BUCKET if set.
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]
