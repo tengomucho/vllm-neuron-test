@@ -47,7 +47,10 @@ for that prototype, to match upstream vLLM's GPU experience
     tokens of 128 off fp32's argmax.
 - **A Docker image** on Ubuntu 26.04, [`docker/Dockerfile`](docker/Dockerfile),
   needs none of this host's workarounds. Its entrypoint is `vllm`, and it
-  serves Qwen3-0.6B and LFM2.5-24B-A2B. See [Docker image](#docker-image).
+  serves Qwen3-0.6B and LFM2.5-24B-A2B up to 128k context
+  ([`scripts/serve_vllm.sh`](scripts/serve_vllm.sh)). It can pull its
+  compile cache from a public HF bucket: LFM2.5 at 128k then starts in 161 s
+  instead of 848 s. See [Docker image](#docker-image).
 - Speed: decode is 10-30% slower than the native NKI implementation at
   TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
   ops (but for segmented prefill), so NKI attention kernels are the next
@@ -109,21 +112,55 @@ Python keeps `libpython3.14.so` on the loader path, so neither the glibc patch
 
 It takes 12.2 GB, most of it the CUDA libraries that vLLM's torch pulls in.
 
+[`scripts/serve_vllm.sh`](scripts/serve_vllm.sh) `<model_id> <tp>
+<max_model_len> [max_num_seqs] [vllm serve args...]` runs `vllm serve` in the
+image, on port 8000:
+
+- prompts are prefilled in chunks of up to 4096 tokens;
+- decode compiles one graph for `max_num_seqs` sequences (1 by default) and,
+  past 32k of context, one more per power of two from 32k, so that shorter
+  sequences read less context;
+- the models go in the volume `neuron-cache` and the compile cache in
+  `neuron-compile-cache` (`CACHE` and `COMPILE_CACHE` change them, a host path
+  works too);
+- `HF_TOKEN` and `NEURON_COMPILE_CACHE_BUCKET` are passed on.
+
 ```bash
 docker build -t vllm-neuron-transformers docker/
+# Optional: start from the graphs already compiled for the commands below.
+export NEURON_COMPILE_CACHE_BUCKET=hf://buckets/tengomucho/vllm-neuron-compile-cache
+# LFM2.5-24B-A2B, TP 4, 128k context, 1 sequence:
+scripts/serve_vllm.sh LiquidAI/LFM2.5-24B-A2B 4 131072
+# LFM2.5-24B-A2B, TP 4, 4k context, 4 sequences (the setup of 2.4):
+scripts/serve_vllm.sh LiquidAI/LFM2.5-24B-A2B 4 4096 4
+# Qwen3-0.6B, with the Transformers backend forced, TP 4, 256 tokens, 2 sequences:
+scripts/serve_vllm.sh Qwen/Qwen3-0.6B 4 256 2 --model-impl transformers
+```
+
+Without the script, the 4k LFM2.5 command is:
+
+```bash
 docker run --rm -p 8000:8000 --shm-size=16g \
   $(for d in /dev/neuron*; do echo --device=$d; done) \
   -v neuron-cache:/root/.cache -v neuron-compile-cache:/root/.cache/neuron-compile \
   -e HF_TOKEN -e NEURON_COMPILE_CACHE_BUCKET \
-  vllm-neuron-transformers serve Qwen/Qwen3-0.6B --model-impl transformers \
-  --tensor-parallel-size 4 --max-model-len 256 --max-num-seqs 2 \
-  --max-num-batched-tokens 256 --no-enable-prefix-caching \
-  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [256], "num_seqs_buckets": [2]}}'
-# LFM2.5-24B-A2B at 4k context, 4 sequences (the setup of 2.4), same docker flags:
-docker run ... vllm-neuron-transformers serve LiquidAI/LFM2.5-24B-A2B \
+  vllm-neuron-transformers serve LiquidAI/LFM2.5-24B-A2B \
   --tensor-parallel-size 4 --max-model-len 4096 --max-num-seqs 4 \
   --max-num-batched-tokens 4096 --no-enable-prefix-caching \
   --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [4096], "num_seqs_buckets": [4]}}'
+```
+
+For 128k, the script passes `--max-model-len 131072 --max-num-seqs 1` instead,
+and the `neuron_config` gets `"num_seqs_buckets": [1]` and
+`"decode_context_length_buckets": [32768, 65536]`.
+
+Once the server logs `Application startup complete`, send it a request:
+
+```bash
+curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "LiquidAI/LFM2.5-24B-A2B",
+  "messages": [{"role": "user", "content": "What is the capital of France?"}],
+  "max_tokens": 256}'
 ```
 
 The branch of the fork is fetched when the image is built, and Docker reuses
@@ -156,9 +193,8 @@ the entrypoint first runs
 `hf buckets sync $NEURON_COMPILE_CACHE_BUCKET /root/.cache/neuron-compile`. If
 the pull fails, it warns and vLLM compiles what it needs. The public bucket
 [`tengomucho/vllm-neuron-compile-cache`](https://huggingface.co/buckets/tengomucho/vllm-neuron-compile-cache)
-holds the graphs of the two commands above, and of LFM2.5-24B-A2B at 128k
-context, compiled on trn2. To push what a run compiled (with an `HF_TOKEN`
-that can write to the bucket):
+holds the graphs of the three commands above, compiled on trn2. To push what a
+run compiled (with an `HF_TOKEN` that can write to the bucket):
 
 ```bash
 docker run --rm -e HF_TOKEN -v neuron-compile-cache:/root/.cache/neuron-compile \
@@ -168,16 +204,23 @@ docker run --rm -e HF_TOKEN -v neuron-compile-cache:/root/.cache/neuron-compile 
 
 #### Tests on this host
 
-Tested on this host, whose Docker daemon sees neither the host's files nor its
-network: the models went to a named volume, and the requests were sent from
-inside the container with `docker exec ... curl` (`-p` is untested). Each run
-sent one chat completion ("What is the capital of France?"). Start-up times
-leave out downloading the model, which was already in the volume:
+This host's Docker daemon sees neither the host's files nor its network: the
+models went to named volumes, and the requests were sent from inside the
+container with `docker exec ... curl` (`-p` is untested). Each run started
+`scripts/serve_vllm.sh` with the commands above and sent one chat completion
+("What is the capital of France?"). The warm starts began from an empty
+compile-cache volume, without `HF_TOKEN`, and pulled the public bucket first
+(459 MB in 4 s). Start-up times leave out downloading the model, which was
+already in the volume:
 
-| model | TP | cold start | warm start | answer |
+| model | TP | cold start | warm start, from the bucket | answer |
 |---|---|---|---|---|
-| Qwen3-0.6B (`--model-impl transformers`) | 4 | 184 s | 70 s | reasons its way to Paris (cut at 64 tokens) |
-| LFM2.5-24B-A2B (4k context, 4 sequences) | 4 | 509 s | 121 s | "The capital of France is Paris.", after 50 tokens of reasoning |
+| Qwen3-0.6B (`--model-impl transformers`) | 4 | 184 s | 64 s | reasons its way to Paris (cut at 64 tokens) |
+| LFM2.5-24B-A2B, 4k context, 4 sequences | 4 | 534 s | 132 s | "The capital of France is Paris.", after 50 tokens of reasoning |
+| LFM2.5-24B-A2B, 128k context, 1 sequence | 4 | 848 s | 161 s | same |
+
+At 128k, a 130,816-token prompt (a text repeated) took 67 s for 32 greedy
+tokens, the text that follows, as in [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
 
 ## 2. Results
 
@@ -602,8 +645,10 @@ python needle_eval.py --model LiquidAI/LFM2.5-24B-A2B --tp 4 --max-model-len 131
 VLLM_NEURON_CPU_MODE=1 python -m pytest -q test/unit/model/
 # Plain transformers on torch-neuronx (leave TORCH_DEVICE_BACKEND_AUTOLOAD unset):
 env -u TORCH_DEVICE_BACKEND_AUTOLOAD NEURON_RT_VISIBLE_CORES=8 python run_qwen3_transformers.py
-# Docker image, from ~/Dev/vllm-test (`docker run` commands in 1, Docker image):
+# Docker image, from ~/Dev/vllm-test (more in 1, Docker image):
 docker build -t vllm-neuron-transformers docker/
+NEURON_COMPILE_CACHE_BUCKET=hf://buckets/tengomucho/vllm-neuron-compile-cache \
+  scripts/serve_vllm.sh LiquidAI/LFM2.5-24B-A2B 4 131072
 ```
 
 ## 6. Gaps and next steps

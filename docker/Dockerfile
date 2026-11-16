@@ -8,6 +8,8 @@
 #     -v neuron-cache:/root/.cache -v neuron-compile-cache:/root/.cache/neuron-compile \
 #     -e HF_TOKEN -e NEURON_COMPILE_CACHE_BUCKET \
 #     vllm-neuron-transformers serve <model> ...
+#
+# or scripts/serve_vllm.sh <model> <tp> <max_model_len>, which runs the same.
 FROM ubuntu:26.04
 
 ARG DEBIAN_FRONTEND=noninteractive
