@@ -55,15 +55,20 @@ for that prototype, to match upstream vLLM's GPU experience
   TinyLlama size, at both 256 and 2048 context. Attention uses plain PyTorch
   ops (but for segmented prefill), so NKI attention kernels are the next
   step.
-- Found along the way, worth reporting to AWS:
-  - libtorch-neuronx-lite and vllm-neuron disagree on the default compile
-    route;
-  - a PyTorch precompile-cache bug;
-  - neuronx-cc needs `libarchive.so.13`, which no package declares;
-  - the compile cache spans three directories that point to one another:
-    keeping only some of them makes start-up fail instead of recompiling.
+- Found along the way, two issues worth reporting:
+  - **the compile route defaults disagree** (issue 7): with
+    `VLLM_NEURON_BACKEND` unset, vllm-neuron takes the native route but
+    libtorch-neuronx-lite does not. Lite then installs XLA-route torch
+    overrides, which make every GELU model (Gemma3, GPT-2, Phi, ...) fail to
+    compile, and leaves the precompile cache off. vllm-neuron should set the
+    variable before it imports lite;
+  - **a PyTorch precompile-cache bug** (issue 8): a module attribute holding a
+    `torch.dtype` makes Dynamo serialize the dtype of every later tensor as
+    missing, so a warm start fails to load the cached graphs.
 
-  See [Issues found](#4-issues-found).
+  Smaller ones: neuronx-cc needs `libarchive.so.13`, which no package
+  declares, and the compile cache spans three directories that point to one
+  another. See [Issues found](#4-issues-found).
 
 ## 1. Environment
 
