@@ -112,18 +112,21 @@ Python keeps `libpython3.14.so` on the loader path, so neither the glibc patch
 
 It takes 12.2 GB, most of it the CUDA libraries that vLLM's torch pulls in.
 
-[`scripts/serve_vllm.sh`](scripts/serve_vllm.sh) `<model_id> <tp>
-<max_model_len> [max_num_seqs] [vllm serve args...]` runs `vllm serve` in the
-image, on port 8000:
+[`scripts/serve_vllm.sh`](scripts/serve_vllm.sh) `[--warmup-bucket] <model_id>
+<tp> <max_model_len> [max_num_seqs] [vllm serve args...]` runs `vllm serve` in
+the image, on port 8000:
 
 - prompts are prefilled in chunks of up to 4096 tokens;
 - decode compiles one graph for `max_num_seqs` sequences (1 by default) and,
   past 32k of context, one more per power of two from 32k, so that shorter
   sequences read less context;
-- the models go in the volume `neuron-cache` and the compile cache in
-  `neuron-compile-cache` (`CACHE` and `COMPILE_CACHE` change them, a host path
-  works too);
-- `HF_TOKEN` and `NEURON_COMPILE_CACHE_BUCKET` are passed on.
+- the models go in the Docker volume `neuron-cache` and the compile cache in
+  the volume `neuron-compile-cache`, which persist between runs. `CACHE` and
+  `COMPILE_CACHE` change them: an absolute path mounts a host directory
+  instead;
+- `HF_TOKEN` and `NEURON_COMPILE_CACHE_BUCKET` are passed on;
+- `--warmup-bucket` compiles the graphs and pushes them to the bucket instead
+  of serving (see [Compile cache](#compile-cache)).
 
 ```bash
 docker build -t vllm-neuron-transformers docker/
@@ -193,13 +196,20 @@ the entrypoint first runs
 `hf buckets sync $NEURON_COMPILE_CACHE_BUCKET /root/.cache/neuron-compile`. If
 the pull fails, it warns and vLLM compiles what it needs. The public bucket
 [`tengomucho/vllm-neuron-compile-cache`](https://huggingface.co/buckets/tengomucho/vllm-neuron-compile-cache)
-holds the graphs of the three commands above, compiled on trn2. To push what a
-run compiled (with an `HF_TOKEN` that can write to the bucket):
+holds the graphs of the three commands above, compiled on trn2.
+
+Nothing is pushed automatically. To add a model or a configuration to the
+bucket, run its serve command with `--warmup-bucket`, and an `HF_TOKEN` that
+can write to the bucket. The script then:
+
+1. pulls the bucket and starts the server;
+2. waits until the server has compiled its graphs;
+3. sends it one request;
+4. pushes the compile cache to the bucket, and stops the server.
 
 ```bash
-docker run --rm -e HF_TOKEN -v neuron-compile-cache:/root/.cache/neuron-compile \
-  --entrypoint hf vllm-neuron-transformers \
-  buckets sync /root/.cache/neuron-compile hf://buckets/tengomucho/vllm-neuron-compile-cache
+NEURON_COMPILE_CACHE_BUCKET=hf://buckets/tengomucho/vllm-neuron-compile-cache \
+  scripts/serve_vllm.sh --warmup-bucket LiquidAI/LFM2.5-24B-A2B 4 131072
 ```
 
 #### Tests on this host
@@ -221,6 +231,11 @@ already in the volume:
 
 At 128k, a 130,816-token prompt (a text repeated) took 67 s for 32 greedy
 tokens, the text that follows, as in [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
+
+`--warmup-bucket` was tested with Qwen3-0.6B, from an empty volume, against an
+empty prefix of the bucket. It compiled the graphs and pushed 29 files
+(58 MB) in 191 s. A server started from another empty volume, pulling that
+prefix, was then ready in 64 s.
 
 ## 2. Results
 
