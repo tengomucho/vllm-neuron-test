@@ -166,6 +166,15 @@ curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" -
   "max_tokens": 256}'
 ```
 
+Or chat with it in a terminal: [`scripts/chat.py`](scripts/chat.py) streams
+the answers of the model served on `localhost:8000` and keeps the
+conversation. It is a uv script, which brings its own `openai` package, so it
+runs without the venv. `exit`, `quit` or Ctrl-D ends it.
+
+```bash
+scripts/chat.py
+```
+
 The branch of the fork is fetched when the image is built, and Docker reuses
 that layer afterwards. To pick up a newer commit, rebuild with `--no-cache`,
 or pass one with `--build-arg VLLM_NEURON_REF=<commit>`.
