@@ -56,7 +56,6 @@ for that prototype, to match upstream vLLM's GPU experience
   ops (but for segmented prefill), so NKI attention kernels are the next
   step.
 - Found along the way, worth reporting to AWS:
-  - the public torch-neuronx 2.33 wheels require glibc 2.43;
   - libtorch-neuronx-lite and vllm-neuron disagree on the default compile
     route;
   - a PyTorch precompile-cache bug;
