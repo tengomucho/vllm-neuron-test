@@ -6,7 +6,7 @@ prototyping the **Transformers modeling backend** in it. AWS Annapurna asked
 for that prototype, to match upstream vLLM's GPU experience
 (`--model-impl transformers`).
 
-- Date: 2026-11-10 to 13.
+- Date: 2026-11-10 to 17.
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
@@ -41,10 +41,11 @@ for that prototype, to match upstream vLLM's GPU experience
   attention for long prompts. See [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
   - 4k context: TTFT 0.74 s for 3968 tokens, decode 38 ms/token (104
     tokens/s with 4 sequences), GSM8K 93/100.
-  - 128k context: TTFT 66 s for 131k tokens, decode 47 ms/token, and
-    15/15 needles found at 32k, 64k and 128k.
-  - Its logprobs are as close to HF fp32 as HF's own bf16 run: 16 and 15
-    tokens of 128 off fp32's argmax.
+  - 128k context: TTFT 67 s for 131k tokens, decode 48 ms/token, and
+    14/15 needles found at 32k, 64k and 128k (5/5 at 128k). The KV cache
+    takes 6.62 GiB per rank and holds 252,544 tokens.
+  - Its logprobs are as close to HF fp32 as HF's own bf16 run: 12 tokens of
+    128 off fp32's argmax for both.
 - **A Docker image** on Ubuntu 26.04, [`docker/Dockerfile`](docker/Dockerfile),
   needs none of this host's workarounds. Its entrypoint is `vllm`, and it
   serves Qwen3-0.6B and LFM2.5-24B-A2B up to 128k context
@@ -245,6 +246,11 @@ already in the volume:
 At 128k, a 130,816-token prompt (a text repeated) took 67 s for 32 greedy
 tokens, the text that follows, as in [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
 
+These runs predate the conv-state fix of 2026-11-17 (issue 16), which changes
+the LFM2.5 graphs: the bucket's LFM2.5 graphs no longer match, and an image
+built from the current branch compiles them again until they are pushed with
+`--warmup-bucket`.
+
 `--warmup-bucket` was tested with Qwen3-0.6B, from an empty volume, against an
 empty prefix of the bucket. It compiled the graphs and pushed 29 files
 (58 MB) in 191 s. A server started from another empty volume, pulling that
@@ -285,7 +291,7 @@ teacher-forced re-scoring):
 | Llama-3.2-1B-Instruct (tied emb.) | yes (Llama) | `--model-impl transformers` | 4 | 1 exact, 1 near-tie at token 7 | 0.054 |
 | TinyLlama-1.1B (4 KV heads, replicated) | yes (Llama) | `--model-impl transformers` | 8 | 1 exact, 1 near-tie at token 8 | 0.039 |
 | tiny-random Qwen3-MoE (8 experts, top-2) | **no** | default (auto fallback), Model Runner V1 | 1 | 1 exact, 1 near-tie at token 9 (vs fp32) | 0.055 |
-| LFM2.5-24B-A2B (hybrid conv/attention, 64 experts) | **no** | default (auto fallback), Model Runner V1 | 4 | 16/128 tokens off fp32's argmax (HF bf16: 15/128) | 1.691 (HF bf16: 1.691) |
+| LFM2.5-24B-A2B (hybrid conv/attention, 64 experts) | **no** | default (auto fallback), Model Runner V1 | 4 | 12/128 tokens off fp32's argmax (HF bf16: 12/128) | 1.439 (HF bf16: 0.805) |
 
 "Max fp32 logit gap" comes from
 [`scripts/teacher_forced_logprobs.py`](scripts/teacher_forced_logprobs.py),
@@ -299,7 +305,8 @@ The LFM2.5-24B-A2B row comes from [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b):
 4 prompts (one of 7936 tokens), 32 tokens each, max_model_len 8192,
 re-scored by [`scripts/bf16_baseline.py`](scripts/bf16_baseline.py). This
 model is sensitive to bf16, so it is compared with HF's own bf16 run rather
-than with a CPU greedy reference, and its gap is the same as HF bf16's.
+than with a CPU greedy reference: both are off fp32's argmax on the same
+number of tokens.
 
 **Online serving:** `vllm serve Qwen/Qwen3-0.6B --model-impl transformers`
 ([`scripts/serve_check.sh`](scripts/serve_check.sh)). An OpenAI
@@ -367,18 +374,37 @@ and 128k of context through `decode_context_length_buckets`):
 
 | prompt tokens | TTFT | prefill | decode |
 |---|---|---|---|
-| 32,512 | 10.5 s | 3.1k tokens/s | 35.6 ms/token |
-| 65,280 | 24.9 s | 2.6k tokens/s | 40.5 ms/token |
-| 130,816 | 65.9 s | 2.0k tokens/s | 47.3 ms/token |
+| 32,512 | 10.8 s | 3.0k tokens/s | 32.0 ms/token |
+| 65,280 | 25.6 s | 2.5k tokens/s | 36.0 ms/token |
+| 130,816 | 67.2 s | 1.9k tokens/s | 47.9 ms/token |
 
 With max_model_len 8192 (and logprobs on), a 7936-token prompt (2 chunks)
-takes 2.3 s.
+takes 2.2 s.
 
-- Start-up: 136 s warm, 924 s cold (compiling the 4 graphs takes 842 s).
-- The KV cache holds 198,432 tokens, 1.5 sequences of 128k. A token takes
-  28 KB: 20 KB of attention K/V and 7.5 KB of conv state. With one conv entry
-  per token (the first LFM2 version), it took 143 KB, which left room for
-  about 49k tokens.
+- Start-up: 137 s warm, 854 s cold (4 graphs to compile).
+- The KV cache takes 6.62 GiB per rank and holds 252,544 tokens (7,892
+  blocks of 32), 1.93 sequences of 128k. A token takes 27.5 KiB: 20 KiB of
+  attention K/V and 7.5 KiB of conv state. One 128k sequence needs 3.44 GiB.
+  With one conv entry per token (the first LFM2 version), a token took
+  140 KiB, which left room for about 49k tokens.
+- vLLM Neuron sizes the cache as `min(HBM × gpu_memory_utilization −
+  weights, HBM × gpu_memory_utilization × 0.30)`: 24 GiB × 0.92 × 0.30 =
+  6.62 GiB here. The 0.30 is `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION`.
+- Device memory of a rank, one logical core with 24 GiB of HBM, read from
+  `neuron-monitor` (the same on the 4 ranks):
+
+  | use | GiB |
+  |---|---|
+  | weights (7.02B parameters: a quarter of the experts, all the rest) | 13.08 |
+  | KV cache: attention K/V, 10 layers | 4.82 |
+  | KV cache: short-conv state, 30 layers | 1.81 |
+  | compiled graphs (`model_code`) | 1.70 |
+  | shared scratchpad | 2.00 |
+  | constants and runtime | 0.06 |
+  | free | 0.54 |
+
+  The cache budget does not count the graphs and the scratchpad (3.7 GiB),
+  so a larger cap fraction would not fit (issue 17).
 - Prompts longer than 4096 tokens are prefilled in 4096-token chunks. Each
   chunk attends over all the chunks before it, so TTFT grows faster than the
   prompt.
@@ -393,16 +419,16 @@ takes 2.3 s.
   greedy tokens under teacher forcing with HF fp32 and HF bf16 (32 tokens per
   prompt). This model is sensitive to bf16 (sigmoid routing with an fp32
   expert bias), so the bar is HF's own bf16 run, not fp32. With the final
-  code and max_model_len 8192, prompts go through the NKI segmented attention,
-  and the 7936-token prompt takes 2 chunks:
+  code, max_model_len 8192 and 4 sequences, prompts go through the NKI
+  segmented attention, and the 7936-token prompt takes 2 chunks:
 
   | prompt | vLLM: tokens not fp32's argmax | vLLM: mean \|logprob − fp32\| | HF bf16: argmax ≠ fp32's | HF bf16: mean \|logprob − fp32\| |
   |---|---|---|---|---|
-  | "The capital of France is" | 6/32 | 0.133 | 6/32 | 0.158 |
-  | "The future of AI is" | 2/32 | 0.123 | 1/32 | 0.147 |
-  | "def fibonacci(n):" | 8/32 | 0.191 | 8/32 | 0.161 |
-  | 7936-token prompt | 0/32 | 0.015 | 0/32 | 0.007 |
-  | **all** | **16/128** | **0.115** | **15/128** | **0.118** |
+  | "The capital of France is" | 6/32 | 0.111 | 6/32 | 0.137 |
+  | "The future of AI is" | 1/32 | 0.092 | 1/32 | 0.116 |
+  | "def fibonacci(n):" | 2/32 | 0.115 | 2/32 | 0.083 |
+  | 7936-token prompt | 3/32 | 0.086 | 3/32 | 0.089 |
+  | **all** | **12/128** | **0.098** | **12/128** | **0.106** |
 
   The first LFM2 version, at 4k (3968-token prompt, one chunk), scored the
   same way: 18/128 and 0.23 for vLLM, 17/128 and 0.25 for HF bf16.
@@ -416,13 +442,17 @@ takes 2.3 s.
 
   | context | prompt tokens | passcode in the final answer |
   |---|---|---|
-  | 32k | 30,636 | 5/5 |
+  | 32k | 30,636 | 4/5 |
   | 64k | 63,404 | 5/5 |
   | 128k | 128,939 | 5/5 |
 
   The model reasons for 200 to 1,600 tokens before it answers, so it gets
-  2048. With 512, 8 of 15 answers were cut while the model was still
-  reasoning, 7 of them after it had quoted the passcode.
+  2048. The miss at 32k (depth 10%) quoted the passcode, then repeated it
+  until the limit. Which prompts end that way changes from one compilation
+  to the next: an earlier version found 15/15, and with other passcodes 2 of
+  5 answers at 128k were cut. With 512 tokens, 8 of 15 answers were cut
+  while the model was still reasoning, 7 of them after it had quoted the
+  passcode.
 - The 130,816-token prompt (README.md repeated) is continued exactly: the 32
   greedy tokens are the README text that follows it.
 
@@ -641,6 +671,19 @@ The commits are on the
 
     The Dockerfile puts all three under `/root/.cache/neuron-compile`, so that
     one volume, or one bucket sync, keeps them together.
+16. **The KV-cache block size is not final when the model is built.** vLLM
+    calls `update_block_size_for_backend`, which sets Neuron's default of 32,
+    after `load_model`. A model that reads `cache_config.block_size` in
+    `from_configs` sees vLLM's default, 16. The LFM2 conv state was laid out
+    for 16-token blocks and used half of each block, which cost 1.4 GiB per
+    rank at 128k. The backend now reads it in `get_kv_spec`.
+17. **The KV-cache budget ignores what the compiled graphs take.** It is
+    sized from the HBM and the weights only. For LFM2.5-24B-A2B at 128k the
+    graphs and the shared scratchpad take 3.7 GiB more, which leaves 0.54 GiB
+    of 24. A model whose graphs take more fails at start-up with `Could not
+    load the model status=4 message=Allocation Failure`, after compiling.
+    Indirect copies are what makes graphs large: with one copy per cache row
+    of the conv state, they took 2.7 GiB instead of 1.7.
 
 ## 5. Reproduce
 
