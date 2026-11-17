@@ -6,7 +6,6 @@ prototyping the **Transformers modeling backend** in it. AWS Annapurna asked
 for that prototype, to match upstream vLLM's GPU experience
 (`--model-impl transformers`).
 
-- Date: 2026-11-10 to 17.
 - Host: a trn2.48xlarge container exposing 4 Neuron devices (16 logical
   cores, LNC=2), Ubuntu 24.04 (glibc 2.39), driver 2.31.6, runtime 2.35.30, no
   EFA devices visible.
@@ -246,9 +245,9 @@ already in the volume:
 At 128k, a 130,816-token prompt (a text repeated) took 67 s for 32 greedy
 tokens, the text that follows, as in [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b).
 
-These runs predate the conv-state fix of 2026-11-17 (issue 16), which changes
-the LFM2.5 graphs: the bucket's LFM2.5 graphs no longer match, and an image
-built from the current branch compiles them again until they are pushed with
+These runs predate the conv-state fix (issue 16), which changes the LFM2.5
+graphs: the bucket's LFM2.5 graphs no longer match, and an image built from
+the current branch compiles them again until they are pushed with
 `--warmup-bucket`.
 
 `--warmup-bucket` was tested with Qwen3-0.6B, from an empty volume, against an
