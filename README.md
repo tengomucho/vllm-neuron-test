@@ -43,6 +43,9 @@ for that prototype, to match upstream vLLM's GPU experience
   - 128k context: TTFT 67 s for 131k tokens, decode 48 ms/token, and
     14/15 needles found at 32k, 64k and 128k (5/5 at 128k). The KV cache
     takes 6.62 GiB per rank and holds 252,544 tokens.
+  - The prefill graph and the scratchpad it needs take 3.55 GiB per rank,
+    which leaves 0.54 GiB free. Prefilling in 2048-token chunks instead of
+    4096 frees 1.88 GiB, for a TTFT of 88 s instead of 67 s at 131k tokens.
   - Its logprobs are as close to HF fp32 as HF's own bf16 run: 12 tokens of
     128 off fp32's argmax for both.
 - **A Docker image** on Ubuntu 26.04, [`docker/Dockerfile`](docker/Dockerfile),
@@ -404,6 +407,52 @@ takes 2.2 s.
 
   The cache budget does not count the graphs and the scratchpad (3.7 GiB),
   so a larger cap fraction would not fit (issue 17).
+- The prefill graph takes most of those 3.7 GiB. What each compiled graph
+  takes on a rank (its two physical cores), logged by the runtime with
+  `NEURON_RT_LOG_LEVEL_TDRV=info`, and the scratchpad it asks for, from the
+  `def.json` files of its NEFF:
+
+  | graph | instructions | spill copy lists | total | scratchpad asked |
+  |---|---|---|---|---|
+  | prefill, 4096-token chunk | 272 MiB | 1,310 MiB | 1,584 MiB | 2,021 MiB |
+  | decode, 32k of context | 34 MiB | 2.5 MiB | 37 MiB | 295 MiB |
+  | decode, 64k of context | 43 MiB | 3.0 MiB | 47 MiB | 295 MiB |
+  | decode, 128k of context | 62 MiB | 4.0 MiB | 67 MiB | 296 MiB |
+
+  - 83% of the prefill graph is `dma rings spill`: the lists of copies
+    between the core's on-chip buffer and the scratchpad. A 4096-token chunk
+    does not fit in that buffer, so the compiler parks intermediate values
+    in the scratchpad and brings them back.
+  - The runtime keeps one scratchpad per rank, as large as the biggest
+    request among the loaded graphs, in steps of 64 MiB
+    ([Neuron device memory](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/explore/device-memory.html)).
+    It is 320 MiB once the decode graphs are loaded, and 2,048 MiB once the
+    prefill graph is. 1,739 MiB of the prefill request is spilled buffer
+    contents.
+  - So prefill costs 3.55 GiB per rank (1.55 of graph, 2.00 of scratchpad),
+    where the three decode graphs alone would need 0.46 GiB.
+  - In the decode graphs, each conv layer has a scratchpad temporary the
+    size of its whole conv-state cache (61.7 MiB), for a step that reads and
+    writes 2 tokens of state. We have not checked whether that much is
+    copied at each step.
+- A smaller prefill chunk trades prefill time for memory. The same engine
+  with 2048-token chunks (`max_num_batched_tokens` and
+  `num_batched_tokens_buckets` at 2048), per rank:
+
+  | | 4096-token chunks | 2048-token chunks |
+  |---|---|---|
+  | prefill graph | 1,584 MiB | 558 MiB |
+  | shared scratchpad | 2,048 MiB | 1,152 MiB |
+  | free | 0.54 GiB | 2.42 GiB |
+  | compiling the prefill graph | 13 min | 6 min |
+  | TTFT, 2,000-token prompt | 1.4 s | 0.8 s |
+  | TTFT, 32,512-token prompt | 10.8 s | 12.6 s |
+  | TTFT, 65,280-token prompt | 25.7 s | 31.4 s |
+  | TTFT, 130,816-token prompt | 67.3 s | 87.7 s |
+
+  TTFT is the time of a request for one token. Halving the chunk frees
+  1.88 GiB per rank; prompts longer than a chunk take 16% to 30% longer to
+  prefill, and a prompt that fits one 2048-token chunk is faster.
 - Prompts longer than 4096 tokens are prefilled in 4096-token chunks. Each
   chunk attends over all the chunks before it, so TTFT grows faster than the
   prompt.
@@ -682,7 +731,10 @@ The commits are on the
     of 24. A model whose graphs take more fails at start-up with `Could not
     load the model status=4 message=Allocation Failure`, after compiling.
     Indirect copies are what makes graphs large: with one copy per cache row
-    of the conv state, they took 2.7 GiB instead of 1.7.
+    of the conv state, they took 2.7 GiB instead of 1.7. The prefill graph
+    is 1.55 GiB of the 1.7 and sets the size of the scratchpad, and both
+    shrink with the prefill chunk (see
+    [2.4](#24-a-24b-hybrid-moe-lfm25-24b-a2b)).
 
 ## 5. Reproduce
 
